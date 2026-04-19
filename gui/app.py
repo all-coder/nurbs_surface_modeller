@@ -129,13 +129,17 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._control_net_actor = None
         self._control_net_mesh = None
         self._control_point_widgets: list[object] = []
+        self._curve_point_widgets: list[object] = []
         self._toolpath_actors: list[object] = []
         self._curve_actors: list[object] = []
         self._curve_hull_actors: list[object] = []
         self._curve_point_actors: list[object] = []
 
         self._selected_control_flat_index: int | None = None
+        self._selected_curve_point_widget_index: int | None = None
+        self._active_widget_layer = "none"
         self._is_syncing_widgets = False
+        self._is_syncing_curve_widgets = False
         self._control_net_visible = True
         self._drag_sensitivity = DEFAULT_DRAG_SENSITIVITY
         self._drag_update_interval_sec = DEFAULT_DRAG_UPDATE_INTERVAL_SEC
@@ -600,7 +604,11 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if self._curve_interaction_mode != "drag":
             self._is_curve_dragging = False
             self._curve_drag_point_index = None
+        else:
+            self.status_label.setText("Drag mode active: drag visible curve handles in viewport")
+
         self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
 
     def _register_viewport_curve_interactions(self) -> None:
         """Register viewport callbacks used for curve click and drag workflows."""
@@ -610,8 +618,6 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             double=False,
             viewport=False,
         )
-        self.plotter.iren.add_observer("LeftButtonPressEvent", self._on_viewport_left_button_press)
-        self.plotter.iren.add_observer("MouseMoveEvent", self._on_viewport_mouse_move)
         self.plotter.iren.add_observer("LeftButtonReleaseEvent", self._on_viewport_left_button_release)
 
     def _display_to_world_point(self, x_position: float, y_position: float, depth: float) -> np.ndarray | None:
@@ -681,6 +687,188 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if float(distances[nearest_index]) > pick_radius:
             return None
         return nearest_index
+
+    def _desired_widget_layer(self) -> str:
+        """Return active sphere-widget layer based on current workflow state."""
+        if self._has_active_surface():
+            return "surface"
+        if self._curve_interaction_mode == "drag" and self._get_active_curve() is not None:
+            return "curve"
+        return "none"
+
+    def _ensure_active_widget_layer(self) -> None:
+        """Ensure only one widget layer is active and synchronized."""
+        desired_layer = self._desired_widget_layer()
+
+        if desired_layer != self._active_widget_layer:
+            self.plotter.clear_sphere_widgets()
+            self._control_point_widgets.clear()
+            self._curve_point_widgets.clear()
+            self._selected_control_flat_index = None
+            self._selected_curve_point_widget_index = None
+            self._active_widget_layer = desired_layer
+
+        if desired_layer == "surface":
+            if not self._has_active_surface():
+                return
+
+            expected_widget_count = int(np.prod(self.surface.control_net.shape[:2]))
+            if len(self._control_point_widgets) != expected_widget_count:
+                self.plotter.clear_sphere_widgets()
+                self._control_point_widgets.clear()
+                self._curve_point_widgets.clear()
+                self._selected_control_flat_index = None
+                self._selected_curve_point_widget_index = None
+                self._active_widget_layer = "surface"
+                self._initialize_control_point_widgets()
+            else:
+                self._sync_widget_positions_from_control_net()
+            return
+
+        if desired_layer == "curve":
+            curve = self._get_active_curve()
+            if curve is None:
+                return
+
+            if len(self._curve_point_widgets) != self._curve_point_count(curve):
+                self.plotter.clear_sphere_widgets()
+                self._control_point_widgets.clear()
+                self._curve_point_widgets.clear()
+                self._selected_curve_point_widget_index = None
+                self._active_widget_layer = "curve"
+                self._initialize_curve_point_widgets()
+            else:
+                self._sync_curve_widget_positions_from_curve()
+
+    def _make_curve_drag_callback(self, point_index: int):
+        """Create and return a drag callback for one curve control point."""
+
+        def _callback(center: tuple[float, float, float], widget: object) -> None:
+            self._on_curve_point_widget_drag(point_index, np.asarray(center, dtype=float), widget)
+
+        return _callback
+
+    def _initialize_curve_point_widgets(self) -> None:
+        """Create draggable sphere widgets for active-curve control points."""
+        curve = self._get_active_curve()
+        if curve is None:
+            self._curve_point_widgets.clear()
+            self._selected_curve_point_widget_index = None
+            return
+
+        self._curve_point_widgets.clear()
+
+        for point_index, point in enumerate(curve.control_points):
+            widget = self.plotter.add_sphere_widget(
+                callback=self._make_curve_drag_callback(point_index),
+                center=point.tolist(),
+                radius=max(1.8, self._default_widget_radius * 1.15),
+                color=(0.99, 0.52, 0.16),
+                selected_color=self._selected_widget_color,
+                pass_widget=True,
+                test_callback=False,
+                interaction_event="always",
+            )
+            self._curve_point_widgets.append(widget)
+
+        selected_index = self.active_curve_point_index
+        if selected_index is None or not (0 <= selected_index < len(self._curve_point_widgets)):
+            selected_index = 0 if self._curve_point_widgets else None
+        self.active_curve_point_index = selected_index
+        self._set_selected_curve_point_widget(selected_index)
+
+    def _set_selected_curve_point_widget(self, point_index: int | None) -> None:
+        """Highlight selected curve-point widget and de-highlight others."""
+        self._selected_curve_point_widget_index = point_index
+
+        for widget_index, widget in enumerate(self._curve_point_widgets):
+            prop = widget.GetSphereProperty()
+            if point_index is not None and widget_index == point_index:
+                prop.SetColor(*self._selected_widget_color)
+                widget.SetRadius(max(self._selected_widget_radius, self._default_widget_radius * 1.2))
+            else:
+                prop.SetColor(0.99, 0.52, 0.16)
+                widget.SetRadius(max(1.8, self._default_widget_radius * 1.15))
+
+    def _sync_curve_widget_positions_from_curve(self) -> None:
+        """Move curve-point widget centers to match active curve control points."""
+        curve = self._get_active_curve()
+        if curve is None or not self._curve_point_widgets:
+            return
+
+        if len(self._curve_point_widgets) != self._curve_point_count(curve):
+            self._initialize_curve_point_widgets()
+            return
+
+        self._is_syncing_curve_widgets = True
+        try:
+            for widget, point in zip(self._curve_point_widgets, curve.control_points):
+                widget.SetCenter(float(point[0]), float(point[1]), float(point[2]))
+        finally:
+            self._is_syncing_curve_widgets = False
+
+        self._set_selected_curve_point_widget(self.active_curve_point_index)
+
+    def _on_curve_point_widget_drag(
+        self,
+        point_index: int,
+        new_center: np.ndarray,
+        widget: object,
+    ) -> None:
+        """Handle active-curve control-point drag events from sphere widgets."""
+        if self._is_syncing_curve_widgets:
+            return
+
+        curve = self._get_active_curve()
+        if curve is None or not (0 <= point_index < self._curve_point_count(curve)):
+            return
+
+        current_time = time.perf_counter()
+        if current_time - self._last_curve_drag_update_timestamp < self._drag_update_interval_sec:
+            return
+        self._last_curve_drag_update_timestamp = current_time
+
+        if not self._is_curve_dragging:
+            self._invalidate_generated_geometry_from_curve_edit()
+            self._clear_surface_visuals()
+
+        self._is_curve_dragging = True
+        self._curve_drag_point_index = point_index
+
+        current_point = curve.control_points[point_index].copy()
+        adjusted_point = current_point + self._drag_sensitivity * (new_center - current_point)
+
+        if self.curve_plane_lock_checkbox.isChecked():
+            adjusted_point[2] = 0.0
+
+        if isinstance(curve, NURBSCurve):
+            curve.update_control_point_inplace(point_index, adjusted_point, float(curve.weights[point_index]))
+        else:
+            curve.update_control_point_inplace(point_index, adjusted_point)
+
+        if self._drag_sensitivity != 1.0:
+            self._is_syncing_curve_widgets = True
+            try:
+                widget.SetCenter(
+                    float(adjusted_point[0]),
+                    float(adjusted_point[1]),
+                    float(adjusted_point[2]),
+                )
+            finally:
+                self._is_syncing_curve_widgets = False
+
+        self.active_curve_point_index = point_index
+        self._set_selected_curve_point_widget(point_index)
+
+        if self.generated_passes:
+            self.generated_passes = []
+            self._clear_toolpath_actors()
+            self._sync_ui_enabled_state()
+
+        self._sync_curve_point_editor_values()
+        self._draw_curve_overlays()
+        self.status_label.setText(f"Dragging curve point P{point_index}")
+        self.plotter.render()
 
     def _on_viewport_left_click(self, display_position: tuple[float, float]) -> None:
         """Handle left-click curve point placement in viewport add mode."""
@@ -843,6 +1031,10 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
         self._sync_curve_point_editor_values()
         self._sync_ui_enabled_state()
+
+        if self._curve_interaction_mode == "drag":
+            self._set_selected_curve_point_widget(self.active_curve_point_index)
+            self.plotter.render()
 
     def _on_add_curve_point(self) -> None:
         """Append one control point to the active curve."""
@@ -1245,6 +1437,16 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             self.status_label.setText(f"Surface generation failed: {error}")
             return
 
+        if self._curve_interaction_mode == "drag":
+            select_index = self.curve_interaction_mode_combo.findData("select")
+            if select_index >= 0:
+                blocked = self.curve_interaction_mode_combo.blockSignals(True)
+                self.curve_interaction_mode_combo.setCurrentIndex(int(select_index))
+                self.curve_interaction_mode_combo.blockSignals(blocked)
+            self._curve_interaction_mode = "select"
+            self._is_curve_dragging = False
+            self._curve_drag_point_index = None
+
         self.generated_passes = []
         self._clear_toolpath_actors()
         self._configure_control_editor_ranges()
@@ -1288,10 +1490,14 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         i_u = int(self.row_spin.value())
         i_v = int(self.col_spin.value())
 
+        u_count, v_count = self.surface.control_net.shape[:2]
+        i_u = max(0, min(i_u, int(u_count) - 1))
+        i_v = max(0, min(i_v, int(v_count) - 1))
+
         self._set_spinboxes_for_control_point(
             i_u,
             i_v,
-            update_index_selectors=False,
+            update_index_selectors=True,
         )
         self._set_selected_control_point(self._uv_to_flat_index(i_u, i_v))
 
@@ -1318,14 +1524,18 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if not self._has_active_surface():
             return
 
-        if update_index_selectors:
-            for widget, value in ((self.row_spin, i_u), (self.col_spin, i_v)):
+        u_count, v_count = self.surface.control_net.shape[:2]
+        safe_i_u = max(0, min(int(i_u), int(u_count) - 1))
+        safe_i_v = max(0, min(int(i_v), int(v_count) - 1))
+
+        if update_index_selectors or safe_i_u != int(i_u) or safe_i_v != int(i_v):
+            for widget, value in ((self.row_spin, safe_i_u), (self.col_spin, safe_i_v)):
                 blocked = widget.blockSignals(True)
                 widget.setValue(int(value))
                 widget.blockSignals(blocked)
 
-        point = self.surface.control_net[i_u, i_v]
-        weight = self.surface.weights[i_u, i_v]
+        point = self.surface.control_net[safe_i_u, safe_i_v]
+        weight = self.surface.weights[safe_i_u, safe_i_v]
 
         for widget, value in (
             (self.x_spin, point[0]),
@@ -1357,12 +1567,21 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         i_u = int(self.row_spin.value())
         i_v = int(self.col_spin.value())
 
+        u_count, v_count = self.surface.control_net.shape[:2]
+        if not (0 <= i_u < int(u_count) and 0 <= i_v < int(v_count)):
+            self.status_label.setText(f"Invalid control-point index ({i_u}, {i_v}) for current surface")
+            return
+
         new_point = np.array(
             [self.x_spin.value(), self.y_spin.value(), self.z_spin.value()],
             dtype=float,
         )
         new_weight = float(self.weight_spin.value())
-        self.surface.update_control_point_inplace(i_u, i_v, new_point, new_weight)
+        try:
+            self.surface.update_control_point_inplace(i_u, i_v, new_point, new_weight)
+        except (IndexError, ValueError) as error:
+            self.status_label.setText(f"Control-point update failed: {error}")
+            return
 
         flat_index = self._uv_to_flat_index(i_u, i_v)
         self._set_selected_control_point(flat_index)
@@ -1442,12 +1661,10 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             draggable marker per control point, each wired to drag callbacks.
         """
         if not self._has_active_surface():
-            self.plotter.clear_sphere_widgets()
             self._control_point_widgets.clear()
             self._selected_control_flat_index = None
             return
 
-        self.plotter.clear_sphere_widgets()
         self._control_point_widgets.clear()
 
         control_points = self.surface.control_net.reshape(-1, 3)
@@ -1541,6 +1758,10 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if not self._has_active_surface() or self._is_syncing_widgets:
             return
 
+        u_count, v_count = self.surface.control_net.shape[:2]
+        if not (0 <= i_u < int(u_count) and 0 <= i_v < int(v_count)):
+            return
+
         current_time = time.perf_counter()
         if current_time - self._last_drag_update_timestamp < self._drag_update_interval_sec:
             return
@@ -1550,7 +1771,10 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         adjusted_point = current_point + self._drag_sensitivity * (new_center - current_point)
 
         current_weight = float(self.surface.weights[i_u, i_v])
-        self.surface.update_control_point_inplace(i_u, i_v, adjusted_point, current_weight)
+        try:
+            self.surface.update_control_point_inplace(i_u, i_v, adjusted_point, current_weight)
+        except (IndexError, ValueError):
+            return
 
         if self._drag_sensitivity != 1.0:
             self._is_syncing_widgets = True
@@ -1645,8 +1869,6 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             self._control_net_actor = None
         self._control_net_mesh = None
 
-        self.plotter.clear_sphere_widgets()
-        self._control_point_widgets.clear()
         self._selected_control_flat_index = None
 
     def _estimate_reference_plane_extent(self) -> float:
@@ -1807,7 +2029,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             )
         )
         self._surface_mesh.points = flat_points
-        self._surface_mesh.modified()
+        self._surface_mesh.Modified()
 
     def _update_control_net_geometry(self) -> None:
         """Update control-net line geometry and visibility state.
@@ -1838,7 +2060,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             )
         else:
             self._control_net_mesh.points = self.surface.control_net.reshape(-1, 3)
-            self._control_net_mesh.modified()
+            self._control_net_mesh.Modified()
 
         if self._control_net_actor is not None:
             self._control_net_actor.SetVisibility(1 if self._control_net_visible else 0)
@@ -1902,17 +2124,13 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 self._update_surface_mesh_geometry()
 
             self._update_control_net_geometry()
-
-            if not self._control_point_widgets:
-                self._initialize_control_point_widgets()
-            else:
-                self._sync_widget_positions_from_control_net()
         else:
             self._clear_surface_visuals()
             self.generated_passes = []
             self._clear_toolpath_actors()
 
         self._draw_curve_overlays()
+        self._ensure_active_widget_layer()
 
         if redraw_toolpath:
             self._clear_toolpath_actors()
