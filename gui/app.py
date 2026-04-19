@@ -1,0 +1,2065 @@
+"""PyQt5 + PyVista based GUI application for NURBS surface modeling."""
+
+# pyright: reportMissingImports=false
+
+from __future__ import annotations
+
+from pathlib import Path
+import time
+
+import numpy as np
+
+from core.curve_validation import build_knots_for_mode
+from core.curves import BSplineCurve, BezierCurve, CurveObject, NURBSCurve
+from config import (
+    DEFAULT_CONTROL_POINT_WIDGET_RADIUS,
+    DEFAULT_DRAG_SENSITIVITY,
+    DEFAULT_DRAG_UPDATE_INTERVAL_SEC,
+    DEFAULT_FEED_RATE_MM_PER_MIN,
+    DEFAULT_PLUNGE_RATE_MM_PER_MIN,
+    DEFAULT_SELECTED_POINT_WIDGET_RADIUS,
+    DEFAULT_SAFE_Z_MM,
+    DEFAULT_SPINDLE_RPM,
+    DEFAULT_STEPOVER_MM,
+    DEFAULT_SURFACE_SAMPLES_U,
+    DEFAULT_SURFACE_SAMPLES_V,
+    DEFAULT_TOOL_RADIUS_MM,
+)
+from gcode.exporter import GCodeSettings, generate_gcode_program, write_gcode_file
+from machining.toolpath import ToolpathPass, generate_zigzag_toolpath
+from surface.factory import create_default_surface
+from surface.providers.extrusion import extrude_surface_from_curve
+from surface.providers.loft import loft_surface_from_curves
+
+GUI_IMPORT_ERROR: Exception | None = None
+
+try:
+    from PyQt5 import QtCore, QtWidgets
+    from pyvistaqt import QtInteractor
+    import pyvista as pv
+except Exception as import_error:  # pragma: no cover - import errors are runtime-environment specific.
+    GUI_IMPORT_ERROR = import_error
+    QtCore = None
+
+    class _FallbackQtWidgets:
+        """Fallback container that provides minimal QtWidgets symbols.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Namespace-like object with placeholder QMainWindow.
+
+        Behavior:
+            Allows this module to be imported in non-GUI environments while
+            run_gui_app raises a clear dependency error before window creation.
+        """
+
+        class QMainWindow:
+            """Placeholder base class used when Qt is unavailable.
+
+            Inputs:
+                None.
+
+            Outputs:
+                None.
+
+            Behavior:
+                Acts only as a class-definition stub and is never instantiated
+                in valid runtime flow because run_gui_app exits early.
+            """
+
+            pass
+
+    QtWidgets = _FallbackQtWidgets
+    QtInteractor = None
+    pv = None
+
+
+class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
+    """Main desktop window that controls rendering and export actions.
+
+    Inputs:
+        None.
+
+    Outputs:
+        Configured Qt window instance.
+
+    Behavior:
+        Owns editable surface state, displays geometry, generates toolpaths, and
+        exports G-code through side-panel controls.
+    """
+
+    def __init__(self) -> None:
+        """Initialize UI state, surface model, and plot actors.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Starts with an empty modeling scene, builds widgets, and draws a
+            permanent CAD-like reference plane for orientation.
+        """
+        super().__init__()
+        self.setWindowTitle("NURBS Surface Modeller")
+        self.resize(1400, 850)
+
+        self.surface = None
+        self.generated_passes: list[ToolpathPass] = []
+
+        self.curves: list[CurveObject] = []
+        self.curve_knot_modes: list[str] = []
+        self.active_curve_index: int | None = None
+        self.active_curve_point_index: int | None = None
+        self._curve_interaction_mode = "select"
+        self._is_curve_dragging = False
+        self._curve_drag_point_index: int | None = None
+        self._last_curve_drag_update_timestamp = 0.0
+        self._curve_drag_pick_radius_mm = 12.0
+
+        self._reference_plane_actor = None
+        self._reference_plane_mesh = None
+        self._reference_plane_extent = 0.0
+
+        self._surface_actor = None
+        self._surface_mesh = None
+        self._control_net_actor = None
+        self._control_net_mesh = None
+        self._control_point_widgets: list[object] = []
+        self._toolpath_actors: list[object] = []
+        self._curve_actors: list[object] = []
+        self._curve_hull_actors: list[object] = []
+        self._curve_point_actors: list[object] = []
+
+        self._selected_control_flat_index: int | None = None
+        self._is_syncing_widgets = False
+        self._control_net_visible = True
+        self._drag_sensitivity = DEFAULT_DRAG_SENSITIVITY
+        self._drag_update_interval_sec = DEFAULT_DRAG_UPDATE_INTERVAL_SEC
+        self._last_drag_update_timestamp = 0.0
+
+        self._default_widget_radius = DEFAULT_CONTROL_POINT_WIDGET_RADIUS
+        self._selected_widget_radius = DEFAULT_SELECTED_POINT_WIDGET_RADIUS
+        self._default_widget_color = (0.82, 0.29, 0.36)
+        self._selected_widget_color = (0.96, 0.74, 0.32)
+
+        self._build_ui()
+        self._refresh_scene(reset_camera=True)
+        self.status_label.setText("Ready: create control input and click Generate Surface")
+
+    def _build_ui(self) -> None:
+        """Build top-level Qt layout and connect interaction callbacks.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Creates a horizontal split with a PyVista viewport on the left and
+            parameter controls on the right.
+        """
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        root_layout = QtWidgets.QHBoxLayout(central)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.plotter = QtInteractor(central)
+        root_layout.addWidget(self.plotter.interactor, stretch=3)
+        self.plotter.set_background("#f8fafc")
+        self.plotter.show_axes()
+
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setSpacing(8)
+        root_layout.addWidget(panel, stretch=1)
+
+        self._build_curve_group(panel_layout)
+        self._build_control_point_group(panel_layout)
+        self._build_surface_generation_group(panel_layout)
+        self._build_toolpath_group(panel_layout)
+        self._build_export_group(panel_layout)
+
+        self._register_viewport_curve_interactions()
+
+        self.status_label = QtWidgets.QLabel("Ready")
+        panel_layout.addWidget(self.status_label)
+        panel_layout.addStretch(1)
+        self._sync_ui_enabled_state()
+
+    def _has_active_surface(self) -> bool:
+        """Return True when an editable surface is currently available.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Boolean indicating whether surface-dependent tools can run.
+
+        Behavior:
+            Centralizes surface existence checks for button and panel gating.
+        """
+        return self.surface is not None
+
+    def _has_valid_surface_input(self) -> bool:
+        """Return True when pending surface input widgets contain valid values.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Boolean indicating whether surface generation is allowed.
+
+        Behavior:
+            Validates source-specific surface inputs from the generation panel.
+        """
+        source_mode = self.surface_source_combo.currentData()
+        if source_mode == "control-net":
+            return int(self.surface_rows_spin.value()) >= 2 and int(self.surface_cols_spin.value()) >= 2
+        if source_mode == "curve-loft":
+            return len(self.curves) >= 2
+        if source_mode == "curve-extrude":
+            return (
+                self._get_active_curve() is not None
+                and float(self.surface_extrude_height_spin.value()) > 0.0
+                and int(self.surface_extrude_layers_spin.value()) >= 2
+            )
+        return False
+
+    def _sync_ui_enabled_state(self) -> None:
+        """Synchronize panel/button enabled states with current geometry state.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Keeps controls consistent with workflow: generate surface first,
+            then edit/generate toolpath, and export only after passes exist.
+        """
+        required_widgets = (
+            "control_point_group",
+            "surface_source_combo",
+            "surface_rows_spin",
+            "surface_cols_spin",
+            "surface_curve_samples_spin",
+            "generate_surface_button",
+            "generate_toolpath_button",
+            "export_gcode_button",
+            "create_curve_button",
+            "delete_curve_button",
+            "add_curve_point_button",
+            "delete_curve_point_button",
+            "apply_curve_point_button",
+            "curve_point_weight_spin",
+            "curve_interaction_mode_combo",
+            "surface_extrude_axis_combo",
+            "surface_extrude_height_spin",
+            "surface_extrude_layers_spin",
+        )
+        if not all(hasattr(self, name) for name in required_widgets):
+            return
+
+        has_surface = self._has_active_surface()
+        has_passes = bool(self.generated_passes)
+        selected_curve = self._get_active_curve()
+        has_curve_selection = selected_curve is not None
+        has_curve_point_selection = (
+            has_curve_selection
+            and self.active_curve_point_index is not None
+            and 0 <= int(self.active_curve_point_index) < self._curve_point_count(selected_curve)
+        )
+
+        selected_is_nurbs = isinstance(selected_curve, NURBSCurve)
+
+        source_mode = self.surface_source_combo.currentData()
+        use_control_net_source = source_mode == "control-net"
+        use_extrude_source = source_mode == "curve-extrude"
+
+        self.surface_rows_spin.setEnabled(use_control_net_source)
+        self.surface_cols_spin.setEnabled(use_control_net_source)
+        self.surface_curve_samples_spin.setEnabled(not use_control_net_source)
+        self.surface_extrude_axis_combo.setEnabled(use_extrude_source)
+        self.surface_extrude_height_spin.setEnabled(use_extrude_source)
+        self.surface_extrude_layers_spin.setEnabled(use_extrude_source)
+
+        self.control_point_group.setEnabled(has_surface)
+        self.generate_surface_button.setEnabled(self._has_valid_surface_input())
+        self.generate_toolpath_button.setEnabled(has_surface)
+        self.export_gcode_button.setEnabled(has_surface and has_passes)
+
+        self.create_curve_button.setEnabled(True)
+        self.delete_curve_button.setEnabled(has_curve_selection)
+        self.add_curve_point_button.setEnabled(has_curve_selection)
+        self.delete_curve_point_button.setEnabled(has_curve_point_selection)
+        self.apply_curve_point_button.setEnabled(has_curve_point_selection)
+        self.curve_point_weight_spin.setEnabled(has_curve_point_selection and selected_is_nurbs)
+
+    def _configure_control_editor_ranges(self) -> None:
+        """Configure row/column editor ranges from active surface dimensions.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Sets safe defaults when no surface exists and updates ranges after
+            explicit surface generation.
+        """
+        if not self._has_active_surface():
+            for widget in (self.row_spin, self.col_spin):
+                blocked = widget.blockSignals(True)
+                widget.setRange(0, 0)
+                widget.setValue(0)
+                widget.blockSignals(blocked)
+            return
+
+        max_u, max_v = np.array(self.surface.control_net.shape[:2]) - 1
+
+        for widget, max_value in ((self.row_spin, int(max_u)), (self.col_spin, int(max_v))):
+            blocked = widget.blockSignals(True)
+            widget.setRange(0, max_value)
+            widget.setValue(min(int(widget.value()), max_value))
+            widget.blockSignals(blocked)
+
+    def _build_curve_group(self, parent_layout) -> None:
+        """Create widgets for interactive multi-curve creation and editing.
+
+        Inputs:
+            parent_layout: Layout receiving the curve controls group.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Allows users to create Bezier, B-spline, and NURBS curves, select
+            active curves, edit control points, and manage per-point weights.
+        """
+        group = QtWidgets.QGroupBox("Curves")
+        self.curve_group = group
+        layout = QtWidgets.QVBoxLayout(group)
+
+        create_row = QtWidgets.QHBoxLayout()
+        self.curve_type_combo = QtWidgets.QComboBox()
+        self.curve_type_combo.addItems(["Bezier", "B-spline", "NURBS"])
+        self.curve_type_combo.currentTextChanged.connect(self._on_curve_type_changed)
+
+        self.curve_degree_spin = QtWidgets.QSpinBox()
+        self.curve_degree_spin.setRange(1, 6)
+        self.curve_degree_spin.setValue(3)
+
+        self.curve_knot_mode_combo = QtWidgets.QComboBox()
+        self.curve_knot_mode_combo.addItems(["Uniform", "Non-uniform"])
+
+        self.create_curve_button = QtWidgets.QPushButton("Create Curve")
+        self.create_curve_button.clicked.connect(self._on_create_curve)
+
+        create_row.addWidget(QtWidgets.QLabel("Type"))
+        create_row.addWidget(self.curve_type_combo)
+        create_row.addWidget(QtWidgets.QLabel("Degree"))
+        create_row.addWidget(self.curve_degree_spin)
+        create_row.addWidget(QtWidgets.QLabel("Knots"))
+        create_row.addWidget(self.curve_knot_mode_combo)
+        create_row.addWidget(self.create_curve_button)
+        layout.addLayout(create_row)
+
+        self.curve_plane_lock_checkbox = QtWidgets.QCheckBox("Place points on XY reference plane (z=0)")
+        self.curve_plane_lock_checkbox.setChecked(True)
+        layout.addWidget(self.curve_plane_lock_checkbox)
+
+        interaction_row = QtWidgets.QHBoxLayout()
+        self.curve_interaction_mode_combo = QtWidgets.QComboBox()
+        self.curve_interaction_mode_combo.addItem("Select", "select")
+        self.curve_interaction_mode_combo.addItem("Add Points (Viewport Click)", "add")
+        self.curve_interaction_mode_combo.addItem("Drag Handles (Viewport)", "drag")
+        self.curve_interaction_mode_combo.currentIndexChanged.connect(self._on_curve_interaction_mode_changed)
+        interaction_row.addWidget(QtWidgets.QLabel("Viewport mode"))
+        interaction_row.addWidget(self.curve_interaction_mode_combo)
+        layout.addLayout(interaction_row)
+
+        self.curve_list_widget = QtWidgets.QListWidget()
+        self.curve_list_widget.currentRowChanged.connect(self._on_curve_selection_changed)
+        layout.addWidget(self.curve_list_widget)
+
+        curve_button_row = QtWidgets.QHBoxLayout()
+        self.delete_curve_button = QtWidgets.QPushButton("Delete Curve")
+        self.delete_curve_button.clicked.connect(self._on_delete_curve)
+        self.add_curve_point_button = QtWidgets.QPushButton("Add Point")
+        self.add_curve_point_button.clicked.connect(self._on_add_curve_point)
+        self.delete_curve_point_button = QtWidgets.QPushButton("Delete Point")
+        self.delete_curve_point_button.clicked.connect(self._on_delete_curve_point)
+
+        curve_button_row.addWidget(self.delete_curve_button)
+        curve_button_row.addWidget(self.add_curve_point_button)
+        curve_button_row.addWidget(self.delete_curve_point_button)
+        layout.addLayout(curve_button_row)
+
+        self.curve_point_list_widget = QtWidgets.QListWidget()
+        self.curve_point_list_widget.currentRowChanged.connect(self._on_curve_point_selection_changed)
+        layout.addWidget(self.curve_point_list_widget)
+
+        editor_form = QtWidgets.QFormLayout()
+        self.curve_point_x_spin = QtWidgets.QDoubleSpinBox()
+        self.curve_point_y_spin = QtWidgets.QDoubleSpinBox()
+        self.curve_point_z_spin = QtWidgets.QDoubleSpinBox()
+        self.curve_point_weight_spin = QtWidgets.QDoubleSpinBox()
+
+        for spin in (self.curve_point_x_spin, self.curve_point_y_spin, self.curve_point_z_spin):
+            spin.setRange(-500.0, 500.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.5)
+
+        self.curve_point_weight_spin.setRange(0.05, 50.0)
+        self.curve_point_weight_spin.setDecimals(3)
+        self.curve_point_weight_spin.setSingleStep(0.1)
+
+        self.apply_curve_point_button = QtWidgets.QPushButton("Apply Point Edit")
+        self.apply_curve_point_button.clicked.connect(self._on_apply_curve_point)
+
+        editor_form.addRow("X", self.curve_point_x_spin)
+        editor_form.addRow("Y", self.curve_point_y_spin)
+        editor_form.addRow("Z", self.curve_point_z_spin)
+        editor_form.addRow("Weight", self.curve_point_weight_spin)
+        editor_form.addRow(self.apply_curve_point_button)
+        layout.addLayout(editor_form)
+
+        parent_layout.addWidget(group)
+        self._on_curve_type_changed(self.curve_type_combo.currentText())
+        self._refresh_curve_list_widget()
+
+    def _curve_type_name(self, curve: CurveObject) -> str:
+        """Return UI curve-type label for one curve instance."""
+        if isinstance(curve, BezierCurve):
+            return "Bezier"
+        if isinstance(curve, BSplineCurve):
+            return "B-spline"
+        return "NURBS"
+
+    def _get_active_curve(self) -> CurveObject | None:
+        """Return currently selected curve instance, if any."""
+        if self.active_curve_index is None:
+            return None
+        if not (0 <= self.active_curve_index < len(self.curves)):
+            return None
+        return self.curves[self.active_curve_index]
+
+    def _curve_point_count(self, curve: CurveObject | None) -> int:
+        """Return number of control points in one curve."""
+        if curve is None:
+            return 0
+        return int(curve.control_points.shape[0])
+
+    def _default_curve_points(self, count: int, curve_slot: int) -> np.ndarray:
+        """Create initial control points for a new curve on the reference plane."""
+        x_values = np.linspace(-30.0, 30.0, count)
+        y_value = 20.0 * float(curve_slot)
+        y_values = np.full(count, y_value, dtype=float)
+        z_values = np.zeros(count, dtype=float)
+        return np.column_stack((x_values, y_values, z_values))
+
+    def _invalidate_generated_geometry_from_curve_edit(self) -> None:
+        """Invalidate dependent generated geometry when source curves change."""
+        self.generated_passes = []
+        self._clear_toolpath_actors()
+
+        if self._has_active_surface():
+            self.surface = None
+            self._configure_control_editor_ranges()
+
+    def _create_curve_from_inputs(self, curve_type: str) -> CurveObject:
+        """Create a new curve from current curve panel settings."""
+        normalized_type = curve_type.strip()
+        degree_value = int(self.curve_degree_spin.value())
+        knot_mode = self.curve_knot_mode_combo.currentText().strip().lower()
+
+        if normalized_type == "Bezier":
+            points = self._default_curve_points(4, len(self.curves))
+            return BezierCurve(points)
+
+        control_count = max(degree_value + 1, 4)
+        points = self._default_curve_points(control_count, len(self.curves))
+        knots = build_knots_for_mode(points, degree_value, knot_mode)
+
+        if normalized_type == "B-spline":
+            return BSplineCurve(points, degree=degree_value, knots=knots)
+
+        weights = np.ones(control_count, dtype=float)
+        return NURBSCurve(points, degree=degree_value, knots=knots, weights=weights)
+
+    def _rebuild_curve_from_components(
+        self,
+        curve: CurveObject,
+        points: np.ndarray,
+        weights: np.ndarray | None,
+        knot_mode: str,
+    ) -> CurveObject:
+        """Reconstruct a curve object from edited components."""
+        if isinstance(curve, BezierCurve):
+            return BezierCurve(points)
+
+        if isinstance(curve, BSplineCurve):
+            degree = min(curve.degree, points.shape[0] - 1)
+            knots = build_knots_for_mode(points, degree, knot_mode)
+            return BSplineCurve(points, degree=degree, knots=knots)
+
+        degree = min(curve.degree, points.shape[0] - 1)
+        if weights is None:
+            raise ValueError("weights are required when rebuilding a NURBS curve")
+        knots = build_knots_for_mode(points, degree, knot_mode)
+        return NURBSCurve(points, degree=degree, knots=knots, weights=weights)
+
+    def _refresh_curve_list_widget(self) -> None:
+        """Refresh curve list widget contents from current curve collection."""
+        blocked = self.curve_list_widget.blockSignals(True)
+        self.curve_list_widget.clear()
+
+        for curve_index, curve in enumerate(self.curves):
+            label = f"{curve_index + 1}: {self._curve_type_name(curve)} ({self._curve_point_count(curve)} pts)"
+            self.curve_list_widget.addItem(label)
+
+        if self.active_curve_index is not None and 0 <= self.active_curve_index < len(self.curves):
+            self.curve_list_widget.setCurrentRow(self.active_curve_index)
+        self.curve_list_widget.blockSignals(blocked)
+
+        self._refresh_curve_point_list_widget()
+
+    def _refresh_curve_point_list_widget(self) -> None:
+        """Refresh active-curve control-point list widget contents."""
+        blocked = self.curve_point_list_widget.blockSignals(True)
+        self.curve_point_list_widget.clear()
+
+        curve = self._get_active_curve()
+        if curve is not None:
+            for point_index, point in enumerate(curve.control_points):
+                label = f"P{point_index}: ({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})"
+                self.curve_point_list_widget.addItem(label)
+
+            if self.active_curve_point_index is not None and 0 <= self.active_curve_point_index < self._curve_point_count(curve):
+                self.curve_point_list_widget.setCurrentRow(self.active_curve_point_index)
+
+        self.curve_point_list_widget.blockSignals(blocked)
+        self._sync_curve_point_editor_values()
+
+    def _sync_curve_point_editor_values(self) -> None:
+        """Synchronize curve point editor spin-box values from selection state."""
+        curve = self._get_active_curve()
+        if curve is None or self.active_curve_point_index is None:
+            defaults = (
+                (self.curve_point_x_spin, 0.0),
+                (self.curve_point_y_spin, 0.0),
+                (self.curve_point_z_spin, 0.0),
+                (self.curve_point_weight_spin, 1.0),
+            )
+            for widget, value in defaults:
+                blocked = widget.blockSignals(True)
+                widget.setValue(float(value))
+                widget.blockSignals(blocked)
+            return
+
+        if not (0 <= self.active_curve_point_index < self._curve_point_count(curve)):
+            return
+
+        point = curve.control_points[self.active_curve_point_index]
+        weight = 1.0
+        if isinstance(curve, NURBSCurve):
+            weight = float(curve.weights[self.active_curve_point_index])
+
+        values = (
+            (self.curve_point_x_spin, point[0]),
+            (self.curve_point_y_spin, point[1]),
+            (self.curve_point_z_spin, point[2]),
+            (self.curve_point_weight_spin, weight),
+        )
+
+        for widget, value in values:
+            blocked = widget.blockSignals(True)
+            widget.setValue(float(value))
+            widget.blockSignals(blocked)
+
+    def _on_curve_type_changed(self, curve_type: str) -> None:
+        """Update curve creation controls when type selection changes."""
+        normalized_type = curve_type.strip()
+        is_bezier = normalized_type == "Bezier"
+
+        self.curve_degree_spin.setEnabled(not is_bezier)
+        self.curve_knot_mode_combo.setEnabled(not is_bezier)
+        self._sync_ui_enabled_state()
+
+    def _on_curve_interaction_mode_changed(self, _index: int) -> None:
+        """Update active viewport interaction mode for curve editing."""
+        self._curve_interaction_mode = str(self.curve_interaction_mode_combo.currentData())
+        if self._curve_interaction_mode != "drag":
+            self._is_curve_dragging = False
+            self._curve_drag_point_index = None
+        self._sync_ui_enabled_state()
+
+    def _register_viewport_curve_interactions(self) -> None:
+        """Register viewport callbacks used for curve click and drag workflows."""
+        self.plotter.track_click_position(
+            callback=self._on_viewport_left_click,
+            side="left",
+            double=False,
+            viewport=False,
+        )
+        self.plotter.iren.add_observer("LeftButtonPressEvent", self._on_viewport_left_button_press)
+        self.plotter.iren.add_observer("MouseMoveEvent", self._on_viewport_mouse_move)
+        self.plotter.iren.add_observer("LeftButtonReleaseEvent", self._on_viewport_left_button_release)
+
+    def _display_to_world_point(self, x_position: float, y_position: float, depth: float) -> np.ndarray | None:
+        """Convert one display coordinate and depth value to world coordinates."""
+        renderer = self.plotter.renderer
+        renderer.SetDisplayPoint(float(x_position), float(y_position), float(depth))
+        renderer.DisplayToWorld()
+        world_h = np.asarray(renderer.GetWorldPoint(), dtype=float)
+        if world_h.shape != (4,) or abs(float(world_h[3])) < 1e-6:
+            return None
+
+        world_point = world_h[:3] / float(world_h[3])
+        if np.any(np.isnan(world_point)) or np.any(np.isinf(world_point)):
+            return None
+        return world_point
+
+    def _intersect_display_with_plane(
+        self,
+        display_position: tuple[float, float],
+        plane_z: float,
+    ) -> np.ndarray | None:
+        """Intersect cursor ray from display coordinates with plane z=constant."""
+        x_position, y_position = display_position
+        near_point = self._display_to_world_point(float(x_position), float(y_position), 0.0)
+        far_point = self._display_to_world_point(float(x_position), float(y_position), 1.0)
+        if near_point is None or far_point is None:
+            return None
+
+        ray_direction = far_point - near_point
+        if abs(float(ray_direction[2])) < 1e-7:
+            return None
+
+        t_value = (float(plane_z) - float(near_point[2])) / float(ray_direction[2])
+        if abs(float(t_value)) > 1000.0:
+            return None
+        return near_point + t_value * ray_direction
+
+    def _estimate_world_units_per_screen_pixel(self) -> float:
+        """Estimate world-space distance represented by one screen pixel."""
+        try:
+            camera = self.plotter.renderer.GetActiveCamera()
+            view_angle_deg = float(camera.GetViewAngle())
+            camera_distance = float(camera.GetDistance())
+            window_size = self.plotter.ren_win.GetSize()
+            viewport_height_px = max(float(window_size[1]), 1.0)
+
+            world_view_height = 2.0 * camera_distance * np.tan(np.deg2rad(0.5 * view_angle_deg))
+            if not np.isfinite(world_view_height) or world_view_height <= 0.0:
+                return 1.0
+            return max(float(world_view_height / viewport_height_px), 1e-6)
+        except Exception:
+            return 1.0
+
+    def _nearest_active_curve_point_index(self, world_point: np.ndarray) -> int | None:
+        """Return nearest active-curve point index when within picking threshold."""
+        curve = self._get_active_curve()
+        if curve is None or curve.control_points.shape[0] == 0:
+            return None
+
+        distances = np.linalg.norm(curve.control_points - world_point[None, :], axis=1)
+        nearest_index = int(np.argmin(distances))
+        pixel_world_size = self._estimate_world_units_per_screen_pixel()
+        pick_radius = max(
+            self._curve_drag_pick_radius_mm,
+            16.0 * pixel_world_size,
+        )
+        if float(distances[nearest_index]) > pick_radius:
+            return None
+        return nearest_index
+
+    def _on_viewport_left_click(self, display_position: tuple[float, float]) -> None:
+        """Handle left-click curve point placement in viewport add mode."""
+        if self._curve_interaction_mode != "add":
+            return
+
+        curve = self._get_active_curve()
+        if curve is None:
+            self.status_label.setText("Select a curve before placing viewport points")
+            return
+
+        plane_z = 0.0 if self.curve_plane_lock_checkbox.isChecked() else float(np.mean(curve.control_points[:, 2]))
+        world_point = self._intersect_display_with_plane(display_position, plane_z=plane_z)
+        if world_point is None:
+            self.status_label.setText("Could not map click to workspace plane")
+            return
+
+        if self.curve_plane_lock_checkbox.isChecked():
+            world_point[2] = 0.0
+
+        self._append_point_to_active_curve(world_point, status_text="Curve point placed from viewport click")
+
+    def _on_viewport_left_button_press(self, *_args) -> None:
+        """Start curve-handle drag workflow when drag mode is active."""
+        if self._curve_interaction_mode != "drag":
+            return
+
+        curve = self._get_active_curve()
+        if curve is None:
+            return
+
+        display_position = self.plotter.iren.get_event_position()
+        plane_z = 0.0 if self.curve_plane_lock_checkbox.isChecked() else float(np.mean(curve.control_points[:, 2]))
+        world_point = self._intersect_display_with_plane(display_position, plane_z=plane_z)
+        if world_point is None:
+            return
+
+        nearest_index = self._nearest_active_curve_point_index(world_point)
+        if nearest_index is None:
+            return
+
+        self._is_curve_dragging = True
+        self._curve_drag_point_index = nearest_index
+        self.active_curve_point_index = nearest_index
+
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText(f"Dragging curve point P{nearest_index}")
+
+    def _on_viewport_mouse_move(self, *_args) -> None:
+        """Update active curve control point while dragging in viewport."""
+        if self._curve_interaction_mode != "drag" or not self._is_curve_dragging:
+            return
+
+        curve = self._get_active_curve()
+        point_index = self._curve_drag_point_index
+        if curve is None or point_index is None or not (0 <= point_index < self._curve_point_count(curve)):
+            return
+
+        current_time = time.perf_counter()
+        if current_time - self._last_curve_drag_update_timestamp < self._drag_update_interval_sec:
+            return
+        self._last_curve_drag_update_timestamp = current_time
+
+        display_position = self.plotter.iren.get_event_position()
+        plane_z = 0.0 if self.curve_plane_lock_checkbox.isChecked() else float(curve.control_points[point_index, 2])
+        new_point = self._intersect_display_with_plane(display_position, plane_z=plane_z)
+        if new_point is None:
+            return
+
+        if self.curve_plane_lock_checkbox.isChecked():
+            new_point[2] = 0.0
+
+        if isinstance(curve, NURBSCurve):
+            curve.update_control_point_inplace(point_index, new_point, float(curve.weights[point_index]))
+        else:
+            curve.update_control_point_inplace(point_index, new_point)
+
+        self._sync_curve_point_editor_values()
+        self._draw_curve_overlays()
+        self.plotter.render()
+
+    def _on_viewport_left_button_release(self, *_args) -> None:
+        """Finish curve-handle drag workflow and synchronize panel widgets."""
+        if not self._is_curve_dragging:
+            return
+
+        self._is_curve_dragging = False
+        self._curve_drag_point_index = None
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText("Curve handle drag completed")
+
+    def _on_create_curve(self) -> None:
+        """Create and select a new curve from current curve panel inputs."""
+        try:
+            curve = self._create_curve_from_inputs(self.curve_type_combo.currentText())
+        except ValueError as error:
+            self.status_label.setText(f"Curve creation failed: {error}")
+            return
+
+        knot_mode = self.curve_knot_mode_combo.currentText().strip().lower()
+        if isinstance(curve, BezierCurve):
+            knot_mode = "uniform"
+
+        self.curves.append(curve)
+        self.curve_knot_modes.append(knot_mode)
+        self.active_curve_index = len(self.curves) - 1
+        self.active_curve_point_index = 0
+
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText("Curve created")
+
+    def _on_delete_curve(self) -> None:
+        """Delete currently selected curve."""
+        if self.active_curve_index is None or not (0 <= self.active_curve_index < len(self.curves)):
+            self.status_label.setText("Select a curve to delete")
+            return
+
+        del self.curves[self.active_curve_index]
+        del self.curve_knot_modes[self.active_curve_index]
+
+        if not self.curves:
+            self.active_curve_index = None
+            self.active_curve_point_index = None
+        else:
+            self.active_curve_index = min(self.active_curve_index, len(self.curves) - 1)
+            self.active_curve_point_index = 0
+
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText("Curve deleted")
+
+    def _on_curve_selection_changed(self, row: int) -> None:
+        """Handle active curve selection changes from list widget."""
+        if row < 0 or row >= len(self.curves):
+            self.active_curve_index = None
+            self.active_curve_point_index = None
+        else:
+            self.active_curve_index = int(row)
+            self.active_curve_point_index = 0
+
+        self._refresh_curve_point_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+
+    def _on_curve_point_selection_changed(self, row: int) -> None:
+        """Handle active control-point selection changes for active curve."""
+        curve = self._get_active_curve()
+        if curve is None or row < 0 or row >= self._curve_point_count(curve):
+            self.active_curve_point_index = None
+        else:
+            self.active_curve_point_index = int(row)
+
+        self._sync_curve_point_editor_values()
+        self._sync_ui_enabled_state()
+
+    def _on_add_curve_point(self) -> None:
+        """Append one control point to the active curve."""
+        curve = self._get_active_curve()
+        if curve is None:
+            self.status_label.setText("Select a curve before adding points")
+            return
+
+        points = curve.control_points.copy()
+        if points.shape[0] == 0:
+            new_point = np.array([0.0, 0.0, 0.0], dtype=float)
+        else:
+            new_point = points[-1] + np.array([10.0, 0.0, 0.0], dtype=float)
+
+        if self.curve_plane_lock_checkbox.isChecked():
+            new_point[2] = 0.0
+
+        self._append_point_to_active_curve(new_point, status_text="Curve point added")
+
+    def _append_point_to_active_curve(self, new_point: np.ndarray, status_text: str) -> bool:
+        """Append one control point to active curve and refresh dependent state."""
+        curve = self._get_active_curve()
+        if curve is None:
+            self.status_label.setText("Select a curve before adding points")
+            return False
+
+        points = np.vstack((curve.control_points.copy(), np.asarray(new_point, dtype=float)))
+
+        weights = None
+        if isinstance(curve, NURBSCurve):
+            weights = np.append(curve.weights, 1.0)
+
+        knot_mode = self.curve_knot_modes[self.active_curve_index]
+        self.curves[self.active_curve_index] = self._rebuild_curve_from_components(
+            curve,
+            points,
+            weights,
+            knot_mode,
+        )
+
+        self.active_curve_point_index = points.shape[0] - 1
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText(status_text)
+        return True
+
+    def _on_delete_curve_point(self) -> None:
+        """Delete selected control point from active curve when valid."""
+        curve = self._get_active_curve()
+        if curve is None or self.active_curve_point_index is None:
+            self.status_label.setText("Select a curve point to delete")
+            return
+
+        point_index = int(self.active_curve_point_index)
+        if not (0 <= point_index < self._curve_point_count(curve)):
+            self.status_label.setText("Select a valid curve point to delete")
+            return
+
+        minimum_count = 2
+        if isinstance(curve, (BSplineCurve, NURBSCurve)):
+            minimum_count = curve.degree + 1
+
+        if self._curve_point_count(curve) <= minimum_count:
+            self.status_label.setText("Cannot delete point: curve would become invalid")
+            return
+
+        points = np.delete(curve.control_points, point_index, axis=0)
+
+        weights = None
+        if isinstance(curve, NURBSCurve):
+            weights = np.delete(curve.weights, point_index)
+
+        knot_mode = self.curve_knot_modes[self.active_curve_index]
+        self.curves[self.active_curve_index] = self._rebuild_curve_from_components(
+            curve,
+            points,
+            weights,
+            knot_mode,
+        )
+
+        self.active_curve_point_index = min(point_index, points.shape[0] - 1)
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText("Curve point deleted")
+
+    def _on_apply_curve_point(self) -> None:
+        """Apply coordinate and optional weight edits to active curve point."""
+        curve = self._get_active_curve()
+        if curve is None or self.active_curve_point_index is None:
+            self.status_label.setText("Select a curve point to edit")
+            return
+
+        point_index = int(self.active_curve_point_index)
+        if not (0 <= point_index < self._curve_point_count(curve)):
+            self.status_label.setText("Select a valid curve point to edit")
+            return
+
+        new_point = np.array(
+            [
+                self.curve_point_x_spin.value(),
+                self.curve_point_y_spin.value(),
+                self.curve_point_z_spin.value(),
+            ],
+            dtype=float,
+        )
+        if self.curve_plane_lock_checkbox.isChecked():
+            new_point[2] = 0.0
+
+        if isinstance(curve, NURBSCurve):
+            new_weight = float(self.curve_point_weight_spin.value())
+            curve.update_control_point_inplace(point_index, new_point, new_weight)
+        else:
+            curve.update_control_point_inplace(point_index, new_point)
+
+        self._invalidate_generated_geometry_from_curve_edit()
+        self._refresh_curve_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+        self.status_label.setText("Curve point updated")
+
+    def _build_control_point_group(self, parent_layout) -> None:
+        """Create widgets for control point coordinate and weight editing.
+
+        Inputs:
+            parent_layout: Layout receiving the controls group.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Adds row/column selectors and numeric spin boxes, then binds updates
+            to rebuild the NURBS surface.
+        """
+        group = QtWidgets.QGroupBox("Control Point Editor")
+        self.control_point_group = group
+        layout = QtWidgets.QFormLayout(group)
+
+        self.row_spin = QtWidgets.QSpinBox()
+        self.row_spin.setRange(0, 0)
+        self.col_spin = QtWidgets.QSpinBox()
+        self.col_spin.setRange(0, 0)
+
+        self.x_spin = QtWidgets.QDoubleSpinBox()
+        self.y_spin = QtWidgets.QDoubleSpinBox()
+        self.z_spin = QtWidgets.QDoubleSpinBox()
+        self.weight_spin = QtWidgets.QDoubleSpinBox()
+
+        for spin in (self.x_spin, self.y_spin, self.z_spin):
+            spin.setRange(-500.0, 500.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.5)
+
+        self.weight_spin.setRange(0.05, 50.0)
+        self.weight_spin.setDecimals(3)
+        self.weight_spin.setSingleStep(0.1)
+
+        self.drag_sensitivity_spin = QtWidgets.QDoubleSpinBox()
+        self.drag_sensitivity_spin.setRange(0.1, 2.0)
+        self.drag_sensitivity_spin.setDecimals(2)
+        self.drag_sensitivity_spin.setSingleStep(0.05)
+        self.drag_sensitivity_spin.setValue(self._drag_sensitivity)
+        self.drag_sensitivity_spin.valueChanged.connect(self._on_drag_sensitivity_changed)
+
+        self.show_control_net_checkbox = QtWidgets.QCheckBox("Show control net lines")
+        self.show_control_net_checkbox.setChecked(self._control_net_visible)
+        self.show_control_net_checkbox.toggled.connect(self._on_toggle_control_net)
+
+        self.apply_point_button = QtWidgets.QPushButton("Apply Point Update")
+        self.apply_point_button.clicked.connect(self._on_apply_control_point)
+        self.row_spin.valueChanged.connect(self._sync_spin_boxes_from_state)
+        self.col_spin.valueChanged.connect(self._sync_spin_boxes_from_state)
+
+        layout.addRow("Row index", self.row_spin)
+        layout.addRow("Column index", self.col_spin)
+        layout.addRow("X", self.x_spin)
+        layout.addRow("Y", self.y_spin)
+        layout.addRow("Z", self.z_spin)
+        layout.addRow("Weight", self.weight_spin)
+        layout.addRow("Drag sensitivity", self.drag_sensitivity_spin)
+        layout.addRow(self.show_control_net_checkbox)
+        layout.addRow(self.apply_point_button)
+
+        parent_layout.addWidget(group)
+        self._configure_control_editor_ranges()
+        self._sync_spin_boxes_from_state()
+
+    def _build_surface_generation_group(self, parent_layout) -> None:
+        """Create widgets for explicit surface generation from input settings.
+
+        Inputs:
+            parent_layout: Layout receiving the controls group.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Supports first-pass generation from a control-net size and keeps
+            surface creation explicit through a dedicated action button.
+        """
+        group = QtWidgets.QGroupBox("Surface Generation")
+        layout = QtWidgets.QFormLayout(group)
+
+        self.surface_source_combo = QtWidgets.QComboBox()
+        self.surface_source_combo.addItem("Control Net Demo", "control-net")
+        self.surface_source_combo.addItem("Loft From Curves", "curve-loft")
+        self.surface_source_combo.addItem("Extrude Active Curve", "curve-extrude")
+        self.surface_source_combo.currentIndexChanged.connect(self._on_surface_source_changed)
+
+        self.surface_rows_spin = QtWidgets.QSpinBox()
+        self.surface_rows_spin.setRange(2, 25)
+        self.surface_rows_spin.setValue(4)
+
+        self.surface_cols_spin = QtWidgets.QSpinBox()
+        self.surface_cols_spin.setRange(2, 25)
+        self.surface_cols_spin.setValue(4)
+
+        self.surface_curve_samples_spin = QtWidgets.QSpinBox()
+        self.surface_curve_samples_spin.setRange(10, 200)
+        self.surface_curve_samples_spin.setValue(40)
+
+        self.surface_extrude_axis_combo = QtWidgets.QComboBox()
+        self.surface_extrude_axis_combo.addItem("X+", "x+")
+        self.surface_extrude_axis_combo.addItem("Y+", "y+")
+        self.surface_extrude_axis_combo.addItem("Z+", "z+")
+        self.surface_extrude_axis_combo.setCurrentIndex(2)
+
+        self.surface_extrude_height_spin = QtWidgets.QDoubleSpinBox()
+        self.surface_extrude_height_spin.setRange(1.0, 500.0)
+        self.surface_extrude_height_spin.setValue(30.0)
+        self.surface_extrude_height_spin.setDecimals(3)
+
+        self.surface_extrude_layers_spin = QtWidgets.QSpinBox()
+        self.surface_extrude_layers_spin.setRange(2, 80)
+        self.surface_extrude_layers_spin.setValue(8)
+
+        self.generate_surface_button = QtWidgets.QPushButton("Generate Surface")
+        self.generate_surface_button.clicked.connect(self._on_generate_surface)
+
+        for widget in (
+            self.surface_rows_spin,
+            self.surface_cols_spin,
+            self.surface_curve_samples_spin,
+            self.surface_extrude_height_spin,
+            self.surface_extrude_layers_spin,
+        ):
+            widget.valueChanged.connect(lambda _value: self._sync_ui_enabled_state())
+        self.surface_extrude_axis_combo.currentIndexChanged.connect(self._sync_ui_enabled_state)
+
+        layout.addRow("Source", self.surface_source_combo)
+        layout.addRow("Rows", self.surface_rows_spin)
+        layout.addRow("Columns", self.surface_cols_spin)
+        layout.addRow("Curve samples", self.surface_curve_samples_spin)
+        layout.addRow("Extrude axis", self.surface_extrude_axis_combo)
+        layout.addRow("Extrude height", self.surface_extrude_height_spin)
+        layout.addRow("Extrude layers", self.surface_extrude_layers_spin)
+        layout.addRow(self.generate_surface_button)
+
+        parent_layout.addWidget(group)
+
+    def _on_surface_source_changed(self, _index: int) -> None:
+        """React to surface-source mode changes in generation controls."""
+        self._sync_ui_enabled_state()
+
+    def _build_toolpath_group(self, parent_layout) -> None:
+        """Create widgets for zig-zag toolpath generation parameters.
+
+        Inputs:
+            parent_layout: Layout receiving the controls group.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Adds controls for stepover and tool radius and binds button actions
+            that generate and draw cutter-location passes.
+        """
+        group = QtWidgets.QGroupBox("Toolpath")
+        layout = QtWidgets.QFormLayout(group)
+
+        self.stepover_spin = QtWidgets.QDoubleSpinBox()
+        self.stepover_spin.setRange(0.1, 20.0)
+        self.stepover_spin.setValue(DEFAULT_STEPOVER_MM)
+        self.stepover_spin.setDecimals(3)
+
+        self.radius_spin = QtWidgets.QDoubleSpinBox()
+        self.radius_spin.setRange(0.1, 50.0)
+        self.radius_spin.setValue(DEFAULT_TOOL_RADIUS_MM)
+        self.radius_spin.setDecimals(3)
+
+        self.generate_toolpath_button = QtWidgets.QPushButton("Generate Zig-Zag Toolpath")
+        self.generate_toolpath_button.clicked.connect(self._on_generate_toolpath)
+
+        layout.addRow("Stepover (mm)", self.stepover_spin)
+        layout.addRow("Tool radius (mm)", self.radius_spin)
+        layout.addRow(self.generate_toolpath_button)
+
+        parent_layout.addWidget(group)
+
+    def _build_export_group(self, parent_layout) -> None:
+        """Create widgets for G-code settings and file export.
+
+        Inputs:
+            parent_layout: Layout receiving the controls group.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Captures feed/safe-height settings and allows writing generated
+            toolpaths to a user-selected G-code file.
+        """
+        group = QtWidgets.QGroupBox("G-code Export")
+        layout = QtWidgets.QFormLayout(group)
+
+        self.feed_spin = QtWidgets.QDoubleSpinBox()
+        self.feed_spin.setRange(10.0, 5000.0)
+        self.feed_spin.setValue(DEFAULT_FEED_RATE_MM_PER_MIN)
+        self.feed_spin.setDecimals(1)
+
+        self.plunge_spin = QtWidgets.QDoubleSpinBox()
+        self.plunge_spin.setRange(10.0, 5000.0)
+        self.plunge_spin.setValue(DEFAULT_PLUNGE_RATE_MM_PER_MIN)
+        self.plunge_spin.setDecimals(1)
+
+        self.safe_z_spin = QtWidgets.QDoubleSpinBox()
+        self.safe_z_spin.setRange(0.1, 500.0)
+        self.safe_z_spin.setValue(DEFAULT_SAFE_Z_MM)
+        self.safe_z_spin.setDecimals(3)
+
+        self.spindle_spin = QtWidgets.QSpinBox()
+        self.spindle_spin.setRange(100, 40000)
+        self.spindle_spin.setValue(DEFAULT_SPINDLE_RPM)
+
+        self.export_gcode_button = QtWidgets.QPushButton("Export G-code")
+        self.export_gcode_button.clicked.connect(self._on_export_gcode)
+
+        layout.addRow("Feed (mm/min)", self.feed_spin)
+        layout.addRow("Plunge (mm/min)", self.plunge_spin)
+        layout.addRow("Safe Z (mm)", self.safe_z_spin)
+        layout.addRow("Spindle RPM", self.spindle_spin)
+        layout.addRow(self.export_gcode_button)
+
+        parent_layout.addWidget(group)
+
+    def _on_generate_surface(self) -> None:
+        """Create a surface explicitly from the configured input dimensions.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Creates a surface from the selected source mode (control-net demo
+            or curve loft), resets stale passes, and redraws scene geometry.
+        """
+        if not self._has_valid_surface_input():
+            self.status_label.setText("Provide valid source geometry before generating a surface")
+            return
+
+        source_mode = self.surface_source_combo.currentData()
+
+        try:
+            if source_mode == "control-net":
+                self.surface = create_default_surface(
+                    rows=int(self.surface_rows_spin.value()),
+                    cols=int(self.surface_cols_spin.value()),
+                )
+            elif source_mode == "curve-loft":
+                self.surface = loft_surface_from_curves(
+                    self.curves,
+                    samples_per_curve=int(self.surface_curve_samples_spin.value()),
+                )
+            else:
+                active_curve = self._get_active_curve()
+                if active_curve is None:
+                    raise ValueError("select an active curve before extrusion")
+
+                axis_key = str(self.surface_extrude_axis_combo.currentData())
+                axis_map = {
+                    "x+": np.array([1.0, 0.0, 0.0], dtype=float),
+                    "y+": np.array([0.0, 1.0, 0.0], dtype=float),
+                    "z+": np.array([0.0, 0.0, 1.0], dtype=float),
+                }
+                axis_direction = axis_map.get(axis_key, np.array([0.0, 0.0, 1.0], dtype=float))
+
+                self.surface = extrude_surface_from_curve(
+                    active_curve,
+                    direction=axis_direction,
+                    height=float(self.surface_extrude_height_spin.value()),
+                    layer_count=int(self.surface_extrude_layers_spin.value()),
+                    samples_along_curve=int(self.surface_curve_samples_spin.value()),
+                )
+        except ValueError as error:
+            self.status_label.setText(f"Surface generation failed: {error}")
+            return
+
+        self.generated_passes = []
+        self._clear_toolpath_actors()
+        self._configure_control_editor_ranges()
+        self._sync_spin_boxes_from_state()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=True, recompute_surface=True, redraw_toolpath=False)
+
+        if source_mode == "control-net":
+            self.status_label.setText("Surface generated from configured control net")
+        elif source_mode == "curve-loft":
+            self.status_label.setText("Surface generated by lofting selected curves")
+        else:
+            self.status_label.setText("Surface generated by extruding active curve")
+
+    def _sync_spin_boxes_from_state(self) -> None:
+        """Synchronize editor spin boxes with selected control point state.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Reads currently selected control point and updates coordinate and
+            weight widgets without triggering surface recomputation.
+        """
+        if not self._has_active_surface():
+            for widget, value in (
+                (self.x_spin, 0.0),
+                (self.y_spin, 0.0),
+                (self.z_spin, 0.0),
+                (self.weight_spin, 1.0),
+            ):
+                blocked = widget.blockSignals(True)
+                widget.setValue(float(value))
+                widget.blockSignals(blocked)
+            self._set_selected_control_point(None)
+            return
+
+        i_u = int(self.row_spin.value())
+        i_v = int(self.col_spin.value())
+
+        self._set_spinboxes_for_control_point(
+            i_u,
+            i_v,
+            update_index_selectors=False,
+        )
+        self._set_selected_control_point(self._uv_to_flat_index(i_u, i_v))
+
+    def _set_spinboxes_for_control_point(
+        self,
+        i_u: int,
+        i_v: int,
+        update_index_selectors: bool,
+    ) -> None:
+        """Synchronize row/column and numeric editor controls for one point.
+
+        Inputs:
+            i_u: Control-point row index.
+            i_v: Control-point column index.
+            update_index_selectors: Whether to overwrite row/column selector values.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Updates Qt spin-box values while blocking emitted signals to avoid
+            recursive callbacks.
+        """
+        if not self._has_active_surface():
+            return
+
+        if update_index_selectors:
+            for widget, value in ((self.row_spin, i_u), (self.col_spin, i_v)):
+                blocked = widget.blockSignals(True)
+                widget.setValue(int(value))
+                widget.blockSignals(blocked)
+
+        point = self.surface.control_net[i_u, i_v]
+        weight = self.surface.weights[i_u, i_v]
+
+        for widget, value in (
+            (self.x_spin, point[0]),
+            (self.y_spin, point[1]),
+            (self.z_spin, point[2]),
+            (self.weight_spin, weight),
+        ):
+            blocked = widget.blockSignals(True)
+            widget.setValue(float(value))
+            widget.blockSignals(blocked)
+
+    def _on_apply_control_point(self) -> None:
+        """Apply edited coordinates and weight to the selected control point.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Applies edits to the selected control point in-place, clears stale
+            toolpath overlays, and triggers a full surface refresh.
+        """
+        if not self._has_active_surface():
+            self.status_label.setText("Generate a surface before editing control points")
+            return
+
+        i_u = int(self.row_spin.value())
+        i_v = int(self.col_spin.value())
+
+        new_point = np.array(
+            [self.x_spin.value(), self.y_spin.value(), self.z_spin.value()],
+            dtype=float,
+        )
+        new_weight = float(self.weight_spin.value())
+        self.surface.update_control_point_inplace(i_u, i_v, new_point, new_weight)
+
+        flat_index = self._uv_to_flat_index(i_u, i_v)
+        self._set_selected_control_point(flat_index)
+
+        self.generated_passes = []
+        self._clear_toolpath_actors()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=True, redraw_toolpath=False)
+        self.status_label.setText("Updated selected control point")
+
+    def _uv_to_flat_index(self, i_u: int, i_v: int) -> int:
+        """Convert control-net (u, v) indices to flattened point index.
+
+        Inputs:
+            i_u: Row index in u direction.
+            i_v: Column index in v direction.
+
+        Outputs:
+            Flattened index in row-major order.
+
+        Side effects:
+            None.
+        """
+        if not self._has_active_surface():
+            raise RuntimeError("cannot compute control-point index without active surface")
+        _, v_count = self.surface.control_net.shape[:2]
+        return i_u * v_count + i_v
+
+    def _flat_index_to_uv(self, flat_index: int) -> tuple[int, int]:
+        """Convert flattened control-point index back to (u, v) indices.
+
+        Inputs:
+            flat_index: Flattened row-major index.
+
+        Outputs:
+            Tuple (i_u, i_v) representing control-net coordinates.
+
+        Side effects:
+            None.
+        """
+        if not self._has_active_surface():
+            raise RuntimeError("cannot compute control-point coordinates without active surface")
+        _, v_count = self.surface.control_net.shape[:2]
+        return divmod(flat_index, v_count)
+
+    def _make_control_drag_callback(self, i_u: int, i_v: int):
+        """Create and return a sphere-widget drag callback bound to one point.
+
+        Inputs:
+            i_u: Row index in the control net.
+            i_v: Column index in the control net.
+
+        Outputs:
+            Callable accepted by PyVista sphere-widget API.
+
+        Side effects:
+            None at creation time. The returned callback mutates control points
+            and scene geometry while dragging.
+        """
+
+        def _callback(center: tuple[float, float, float], widget: object) -> None:
+            self._on_control_point_drag(i_u, i_v, np.asarray(center, dtype=float), widget)
+
+        return _callback
+
+    def _initialize_control_point_widgets(self) -> None:
+        """Create draggable sphere widgets for all control points.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Clears existing sphere widgets from the plotter and re-adds one
+            draggable marker per control point, each wired to drag callbacks.
+        """
+        if not self._has_active_surface():
+            self.plotter.clear_sphere_widgets()
+            self._control_point_widgets.clear()
+            self._selected_control_flat_index = None
+            return
+
+        self.plotter.clear_sphere_widgets()
+        self._control_point_widgets.clear()
+
+        control_points = self.surface.control_net.reshape(-1, 3)
+        for flat_index, point in enumerate(control_points):
+            i_u, i_v = self._flat_index_to_uv(flat_index)
+            widget = self.plotter.add_sphere_widget(
+                callback=self._make_control_drag_callback(i_u, i_v),
+                center=point.tolist(),
+                radius=self._default_widget_radius,
+                color=self._default_widget_color,
+                selected_color=self._selected_widget_color,
+                pass_widget=True,
+                test_callback=False,
+                interaction_event="always",
+            )
+            self._control_point_widgets.append(widget)
+
+        if self._selected_control_flat_index is None and self._control_point_widgets:
+            self._selected_control_flat_index = 0
+        self._set_selected_control_point(self._selected_control_flat_index)
+
+    def _set_selected_control_point(self, flat_index: int | None) -> None:
+        """Highlight the active control-point widget and de-highlight others.
+
+        Inputs:
+            flat_index: Selected flattened index, or None to clear selection.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Updates sphere-widget color and radius properties in the viewport.
+        """
+        self._selected_control_flat_index = flat_index
+        for widget_index, widget in enumerate(self._control_point_widgets):
+            prop = widget.GetSphereProperty()
+            if flat_index is not None and widget_index == flat_index:
+                prop.SetColor(*self._selected_widget_color)
+                widget.SetRadius(self._selected_widget_radius)
+            else:
+                prop.SetColor(*self._default_widget_color)
+                widget.SetRadius(self._default_widget_radius)
+
+    def _sync_widget_positions_from_control_net(self) -> None:
+        """Move sphere-widget centers to match current control-point arrays.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Programmatically updates widget centers while suppressing recursive
+            drag callback handling.
+        """
+        if not self._has_active_surface() or not self._control_point_widgets:
+            return
+
+        self._is_syncing_widgets = True
+        try:
+            control_points = self.surface.control_net.reshape(-1, 3)
+            for widget, point in zip(self._control_point_widgets, control_points):
+                widget.SetCenter(float(point[0]), float(point[1]), float(point[2]))
+        finally:
+            self._is_syncing_widgets = False
+
+    def _on_control_point_drag(
+        self,
+        i_u: int,
+        i_v: int,
+        new_center: np.ndarray,
+        widget: object,
+    ) -> None:
+        """Handle interactive sphere-widget drag updates for one control point.
+
+        Inputs:
+            i_u: Row index of the dragged control point.
+            i_v: Column index of the dragged control point.
+            new_center: New 3D center reported by the widget.
+            widget: Widget instance generating the callback.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Mutates control-point geometry, updates surface and control-net mesh
+            geometry in real time, clears stale toolpath overlays, and refreshes
+            UI controls and status text.
+        """
+        if not self._has_active_surface() or self._is_syncing_widgets:
+            return
+
+        current_time = time.perf_counter()
+        if current_time - self._last_drag_update_timestamp < self._drag_update_interval_sec:
+            return
+        self._last_drag_update_timestamp = current_time
+
+        current_point = self.surface.control_net[i_u, i_v].copy()
+        adjusted_point = current_point + self._drag_sensitivity * (new_center - current_point)
+
+        current_weight = float(self.surface.weights[i_u, i_v])
+        self.surface.update_control_point_inplace(i_u, i_v, adjusted_point, current_weight)
+
+        if self._drag_sensitivity != 1.0:
+            self._is_syncing_widgets = True
+            try:
+                widget.SetCenter(
+                    float(adjusted_point[0]),
+                    float(adjusted_point[1]),
+                    float(adjusted_point[2]),
+                )
+            finally:
+                self._is_syncing_widgets = False
+
+        flat_index = self._uv_to_flat_index(i_u, i_v)
+        self._set_selected_control_point(flat_index)
+        self._set_spinboxes_for_control_point(i_u, i_v, update_index_selectors=True)
+
+        if self.generated_passes:
+            self.generated_passes = []
+            self._clear_toolpath_actors()
+            self._sync_ui_enabled_state()
+
+        self._update_surface_mesh_geometry()
+        self._update_control_net_geometry()
+        self.status_label.setText(f"Dragging control point ({i_u}, {i_v})")
+        self.plotter.render()
+
+    def _clear_curve_actors(self) -> None:
+        """Remove all rendered curve, hull, and curve-point actors."""
+        for actor in self._curve_actors:
+            self.plotter.remove_actor(actor)
+        self._curve_actors.clear()
+
+        for actor in self._curve_hull_actors:
+            self.plotter.remove_actor(actor)
+        self._curve_hull_actors.clear()
+
+        for actor in self._curve_point_actors:
+            self.plotter.remove_actor(actor)
+        self._curve_point_actors.clear()
+
+    def _draw_curve_overlays(self) -> None:
+        """Render all curves with control polygons and control points."""
+        self._clear_curve_actors()
+
+        for curve_index, curve in enumerate(self.curves):
+            control_points = np.asarray(curve.control_points, dtype=float)
+            if control_points.shape[0] < 2:
+                continue
+
+            is_active = self.active_curve_index == curve_index
+            hull_color = "#f59e0b" if is_active else "#9ca3af"
+            curve_color = "#dc2626" if is_active else "#2563eb"
+            point_color = "#f97316" if is_active else "#475569"
+
+            hull_mesh = pv.lines_from_points(control_points, close=False)
+            hull_actor = self.plotter.add_mesh(hull_mesh, color=hull_color, line_width=2)
+            self._curve_hull_actors.append(hull_actor)
+
+            sampled_points = curve.sample_points(120)
+            curve_mesh = pv.lines_from_points(sampled_points, close=False)
+            curve_actor = self.plotter.add_mesh(curve_mesh, color=curve_color, line_width=4)
+            self._curve_actors.append(curve_actor)
+
+            points_actor = self.plotter.add_points(
+                control_points,
+                color=point_color,
+                point_size=16,
+                render_points_as_spheres=True,
+            )
+            self._curve_point_actors.append(points_actor)
+
+    def _clear_surface_visuals(self) -> None:
+        """Remove all surface-derived actors/widgets while keeping scene helpers.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Clears surface mesh, control net, and control-point widgets when the
+            application is in no-active-surface mode.
+        """
+        if self._surface_actor is not None:
+            self.plotter.remove_actor(self._surface_actor)
+            self._surface_actor = None
+        self._surface_mesh = None
+
+        if self._control_net_actor is not None:
+            self.plotter.remove_actor(self._control_net_actor)
+            self._control_net_actor = None
+        self._control_net_mesh = None
+
+        self.plotter.clear_sphere_widgets()
+        self._control_point_widgets.clear()
+        self._selected_control_flat_index = None
+
+    def _estimate_reference_plane_extent(self) -> float:
+        """Return a half-extent that keeps the XY reference plane usable.
+
+        Inputs:
+            None.
+
+        Outputs:
+            Positive half-extent for a square XY plane.
+
+        Behavior:
+            Uses a fixed baseline and expands to comfortably include active
+            surface control points when available.
+        """
+        extent = 120.0
+
+        if self.curves:
+            all_curve_xy = np.vstack([curve.control_points[:, :2] for curve in self.curves])
+            max_curve_axis = float(np.max(np.abs(all_curve_xy)))
+            extent = max(extent, max_curve_axis + 30.0)
+
+        if self._has_active_surface():
+            xy_coords = self.surface.control_net[:, :, :2].reshape(-1, 2)
+            max_axis = float(np.max(np.abs(xy_coords)))
+            extent = max(extent, max_axis + 30.0)
+        return extent
+
+    def _ensure_reference_plane_geometry(self) -> None:
+        """Create or update the permanent XY reference plane actor.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Keeps a non-modeling CAD-style plane visible at Z=0 for spatial
+            orientation before and after surface creation.
+        """
+        desired_extent = self._estimate_reference_plane_extent()
+        needs_rebuild = (
+            self._reference_plane_mesh is None
+            or abs(desired_extent - self._reference_plane_extent) > 1e-6
+        )
+
+        if needs_rebuild:
+            self._reference_plane_extent = desired_extent
+            self._reference_plane_mesh = pv.Plane(
+                center=(0.0, 0.0, 0.0),
+                direction=(0.0, 0.0, 1.0),
+                i_size=2.0 * desired_extent,
+                j_size=2.0 * desired_extent,
+                i_resolution=30,
+                j_resolution=30,
+            )
+
+            if self._reference_plane_actor is not None:
+                self.plotter.remove_actor(self._reference_plane_actor)
+
+            self._reference_plane_actor = self.plotter.add_mesh(
+                self._reference_plane_mesh,
+                color="#dbeafe",
+                opacity=0.30,
+                show_edges=True,
+                edge_color="#94a3b8",
+                line_width=1,
+                pickable=False,
+            )
+
+        if self._reference_plane_actor is not None:
+            self._reference_plane_actor.SetVisibility(1)
+
+    def _create_control_net_mesh(self) -> object:
+        """Build PolyData for control-net grid lines from current control points.
+
+        Inputs:
+            None.
+
+        Outputs:
+            PyVista PolyData containing control-net line connectivity.
+
+        Side effects:
+            None.
+        """
+        if not self._has_active_surface():
+            raise RuntimeError("cannot create control-net mesh without active surface")
+
+        control_points = self.surface.control_net
+        u_count, v_count = control_points.shape[:2]
+
+        points_flat = control_points.reshape(-1, 3).copy()
+        lines: list[int] = []
+
+        for i_u in range(u_count):
+            for i_v in range(v_count - 1):
+                start = self._uv_to_flat_index(i_u, i_v)
+                end = self._uv_to_flat_index(i_u, i_v + 1)
+                lines.extend([2, start, end])
+
+        for i_v in range(v_count):
+            for i_u in range(u_count - 1):
+                start = self._uv_to_flat_index(i_u, i_v)
+                end = self._uv_to_flat_index(i_u + 1, i_v)
+                lines.extend([2, start, end])
+
+        mesh = pv.PolyData()
+        mesh.points = points_flat
+        if lines:
+            mesh.lines = np.asarray(lines, dtype=np.int64)
+        return mesh
+
+    def _update_surface_mesh_geometry(self) -> None:
+        """Recompute and apply surface geometry on the existing mesh actor.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Evaluates the NURBS grid and mutates surface mesh points in-place,
+            creating the actor only once on first call.
+        """
+        if not self._has_active_surface():
+            if self._surface_actor is not None:
+                self.plotter.remove_actor(self._surface_actor)
+                self._surface_actor = None
+            self._surface_mesh = None
+            return
+
+        points, _, _, _ = self.surface.evaluate_grid(
+            u_samples=DEFAULT_SURFACE_SAMPLES_U,
+            v_samples=DEFAULT_SURFACE_SAMPLES_V,
+        )
+
+        if self._surface_mesh is None:
+            x_grid = points[:, :, 0]
+            y_grid = points[:, :, 1]
+            z_grid = points[:, :, 2]
+            self._surface_mesh = pv.StructuredGrid(x_grid, y_grid, z_grid)
+            self._surface_actor = self.plotter.add_mesh(
+                self._surface_mesh,
+                color="#7eb6ff",
+                opacity=0.85,
+                show_edges=True,
+                edge_color="#2f4f6f",
+            )
+            return
+
+        flat_points = np.column_stack(
+            (
+                points[:, :, 0].ravel(order="F"),
+                points[:, :, 1].ravel(order="F"),
+                points[:, :, 2].ravel(order="F"),
+            )
+        )
+        self._surface_mesh.points = flat_points
+        self._surface_mesh.modified()
+
+    def _update_control_net_geometry(self) -> None:
+        """Update control-net line geometry and visibility state.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Creates control-net actor once and then updates PolyData points
+            in-place as control points move.
+        """
+        if not self._has_active_surface():
+            if self._control_net_actor is not None:
+                self.plotter.remove_actor(self._control_net_actor)
+                self._control_net_actor = None
+            self._control_net_mesh = None
+            return
+
+        if self._control_net_mesh is None:
+            self._control_net_mesh = self._create_control_net_mesh()
+            self._control_net_actor = self.plotter.add_mesh(
+                self._control_net_mesh,
+                color="#1d3557",
+                line_width=2,
+            )
+        else:
+            self._control_net_mesh.points = self.surface.control_net.reshape(-1, 3)
+            self._control_net_mesh.modified()
+
+        if self._control_net_actor is not None:
+            self._control_net_actor.SetVisibility(1 if self._control_net_visible else 0)
+
+    def _on_drag_sensitivity_changed(self, value: float) -> None:
+        """Update drag sensitivity factor used during widget movement.
+
+        Inputs:
+            value: New sensitivity multiplier in range [0.1, 2.0].
+
+        Outputs:
+            None.
+
+        Side effects:
+            Changes how far control points move relative to raw widget movement.
+        """
+        self._drag_sensitivity = float(value)
+
+    def _on_toggle_control_net(self, enabled: bool) -> None:
+        """Toggle visibility of control-net grid-line actor.
+
+        Inputs:
+            enabled: True to show control-net lines, False to hide them.
+
+        Outputs:
+            None.
+
+        Side effects:
+            Updates actor visibility and refreshes the viewport.
+        """
+        self._control_net_visible = bool(enabled)
+        if self._control_net_actor is not None:
+            self._control_net_actor.SetVisibility(1 if enabled else 0)
+            self.plotter.render()
+
+    def _refresh_scene(
+        self,
+        reset_camera: bool,
+        recompute_surface: bool = True,
+        redraw_toolpath: bool = True,
+    ) -> None:
+        """Redraw surface mesh, control points, and optional toolpath overlays.
+
+        Inputs:
+            reset_camera: Whether the viewport camera should reset.
+            recompute_surface: Whether to recompute and apply surface geometry.
+            redraw_toolpath: Whether to rebuild toolpath overlay actors.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Updates mesh geometries without recreating the plotter window. The
+            surface and control net are updated in-place, while optional overlays
+            can be rebuilt as needed.
+        """
+        self._ensure_reference_plane_geometry()
+
+        if self._has_active_surface():
+            if recompute_surface:
+                self._update_surface_mesh_geometry()
+
+            self._update_control_net_geometry()
+
+            if not self._control_point_widgets:
+                self._initialize_control_point_widgets()
+            else:
+                self._sync_widget_positions_from_control_net()
+        else:
+            self._clear_surface_visuals()
+            self.generated_passes = []
+            self._clear_toolpath_actors()
+
+        self._draw_curve_overlays()
+
+        if redraw_toolpath:
+            self._clear_toolpath_actors()
+            self._draw_toolpath_overlay()
+
+        self._sync_ui_enabled_state()
+
+        if reset_camera:
+            self.plotter.reset_camera()
+        self.plotter.render()
+
+    def _on_generate_toolpath(self) -> None:
+        """Generate zig-zag toolpath from current surface and render overlay.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Computes scanline passes using current machining settings and updates
+            visual overlays and status text with pass statistics.
+        """
+        if not self._has_active_surface():
+            self.status_label.setText("Generate a surface before generating toolpath")
+            return
+
+        self.generated_passes = generate_zigzag_toolpath(
+            surface=self.surface,
+            stepover_mm=float(self.stepover_spin.value()),
+            tool_radius_mm=float(self.radius_spin.value()),
+        )
+        self._refresh_scene(reset_camera=False)
+        self._sync_ui_enabled_state()
+
+        total_points = sum(len(item.points) for item in self.generated_passes)
+        self.status_label.setText(
+            f"Generated {len(self.generated_passes)} passes with {total_points} CL points"
+        )
+
+    def _draw_toolpath_overlay(self) -> None:
+        """Draw generated toolpath passes as line segments in the 3D viewport.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Converts each pass into connected line segments and adds them as
+            lightweight colored actors for visual verification.
+        """
+        if not self.generated_passes:
+            return
+
+        for tool_pass in self.generated_passes:
+            points = np.array([item.cl_point for item in tool_pass.points], dtype=float)
+            if len(points) < 2:
+                continue
+
+            line_mesh = pv.lines_from_points(points, close=False)
+            actor = self.plotter.add_mesh(line_mesh, color="#2a9d8f", line_width=3)
+            self._toolpath_actors.append(actor)
+
+    def _clear_toolpath_actors(self) -> None:
+        """Remove currently displayed toolpath actors from the viewport.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Iterates over cached actor references, removes each from the plotter,
+            and clears internal actor storage.
+        """
+        for actor in self._toolpath_actors:
+            self.plotter.remove_actor(actor)
+        self._toolpath_actors.clear()
+
+    def _on_export_gcode(self) -> None:
+        """Export generated passes to a user-selected G-code output file.
+
+        Inputs:
+            None.
+
+        Outputs:
+            None.
+
+        Behavior:
+            Opens a save-file dialog, generates CNC code from current passes and
+            machine settings, writes output, and updates status text.
+        """
+        if not self._has_active_surface():
+            self.status_label.setText("Generate a surface before exporting G-code")
+            return
+
+        if not self.generated_passes:
+            self.status_label.setText("Generate toolpath before exporting G-code")
+            return
+
+        output_file, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save G-code",
+            "toolpath.nc",
+            "G-code (*.nc *.gcode *.txt)",
+        )
+        if not output_file:
+            self.status_label.setText("G-code export canceled")
+            return
+
+        settings = GCodeSettings(
+            safe_z_mm=float(self.safe_z_spin.value()),
+            feed_rate_mm_per_min=float(self.feed_spin.value()),
+            plunge_rate_mm_per_min=float(self.plunge_spin.value()),
+            spindle_rpm=int(self.spindle_spin.value()),
+        )
+        gcode_text = generate_gcode_program(self.generated_passes, settings)
+        written_path = write_gcode_file(Path(output_file), gcode_text)
+        self.status_label.setText(f"Exported G-code to {written_path}")
+
+
+def run_gui_app() -> int:
+    """Start the GUI application loop and return process exit code.
+
+    Inputs:
+        None.
+
+    Outputs:
+        Integer process exit code from Qt event loop.
+
+    Behavior:
+        Validates runtime GUI dependencies, creates QApplication, launches the
+        main window, and blocks until the user closes the application.
+    """
+    if GUI_IMPORT_ERROR is not None:
+        raise ImportError(
+            "GUI dependencies are missing. Install PyQt5, pyvista, and pyvistaqt."
+        ) from GUI_IMPORT_ERROR
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+
+    window = NURBSSurfaceMainWindow()
+    window.show()
+    return int(app.exec_())
