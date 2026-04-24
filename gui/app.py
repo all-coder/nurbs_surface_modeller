@@ -30,6 +30,8 @@ from machining.toolpath import ToolpathPass, generate_zigzag_toolpath
 from surface.factory import create_default_surface
 from surface.providers.extrusion import extrude_surface_from_curve
 from surface.providers.loft import loft_surface_from_curves
+from surface.providers.surface_body_extrusion import build_surface_extrusion_mesh
+from surface.providers.surface_normal_extrusion import extrude_surface_along_center_normal
 
 GUI_IMPORT_ERROR: Exception | None = None
 
@@ -76,6 +78,79 @@ except Exception as import_error:  # pragma: no cover - import errors are runtim
     pv = None
 
 
+def sanitize_curve_selection_state(
+    valid_curve_ids: list[int],
+    selected_curve_ids: set[int],
+    active_curve_id: int | None,
+    last_interacted_curve_id: int | None,
+) -> tuple[set[int], int | None, int | None]:
+    """Drop invalid selection references and return deterministic active state."""
+    valid_order = [int(curve_id) for curve_id in valid_curve_ids]
+    valid_set = set(valid_order)
+    sanitized_selected = {int(curve_id) for curve_id in selected_curve_ids if int(curve_id) in valid_set}
+
+    sanitized_last = (
+        int(last_interacted_curve_id)
+        if last_interacted_curve_id is not None and int(last_interacted_curve_id) in valid_set
+        else None
+    )
+
+    if not sanitized_selected:
+        return set(), None, None
+
+    sanitized_active = (
+        int(active_curve_id)
+        if active_curve_id is not None and int(active_curve_id) in sanitized_selected
+        else None
+    )
+    if sanitized_active is None:
+        if sanitized_last is not None and sanitized_last in sanitized_selected:
+            sanitized_active = sanitized_last
+        else:
+            sanitized_active = next(
+                (curve_id for curve_id in valid_order if curve_id in sanitized_selected),
+                None,
+            )
+
+    return sanitized_selected, sanitized_active, sanitized_last
+
+
+def reduce_curve_selection_state(
+    valid_curve_ids: list[int],
+    selected_curve_ids: set[int],
+    active_curve_id: int | None,
+    last_interacted_curve_id: int | None,
+    clicked_curve_id: int | None,
+    shift_pressed: bool,
+) -> tuple[set[int], int | None, int | None]:
+    """Apply one click action to curve-selection state."""
+    valid_set = {int(curve_id) for curve_id in valid_curve_ids}
+
+    if clicked_curve_id is None or int(clicked_curve_id) not in valid_set:
+        return set(), None, None
+
+    clicked_id = int(clicked_curve_id)
+    if shift_pressed:
+        updated_selected = set(int(curve_id) for curve_id in selected_curve_ids if int(curve_id) in valid_set)
+        if clicked_id in updated_selected:
+            updated_selected.remove(clicked_id)
+        else:
+            updated_selected.add(clicked_id)
+        proposed_active = clicked_id if clicked_id in updated_selected else active_curve_id
+        updated_last = clicked_id
+    else:
+        updated_selected = {clicked_id}
+        proposed_active = clicked_id
+        updated_last = clicked_id
+
+    return sanitize_curve_selection_state(
+        valid_curve_ids=valid_curve_ids,
+        selected_curve_ids=updated_selected,
+        active_curve_id=proposed_active,
+        last_interacted_curve_id=updated_last,
+    )
+
+
 class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
     """Main desktop window that controls rendering and export actions.
 
@@ -108,10 +183,21 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.resize(1400, 850)
 
         self.surface = None
+        self.surface_entries: list[dict[str, object]] = []
+        self.active_surface_id: int | None = None
+        self._next_surface_id = 1
+        self._rendered_surface_id: int | None = None
+        self._derived_body_entries: list[dict[str, object]] = []
+        self._derived_body_actors: list[object] = []
         self.generated_passes: list[ToolpathPass] = []
 
         self.curves: list[CurveObject] = []
+        self.curve_ids: list[int] = []
         self.curve_knot_modes: list[str] = []
+        self.selected_curve_ids: set[int] = set()
+        self.active_curve_id: int | None = None
+        self._last_interacted_curve_id: int | None = None
+        self._next_curve_id = 1
         self.active_curve_index: int | None = None
         self.active_curve_point_index: int | None = None
         self._curve_interaction_mode = "select"
@@ -134,6 +220,12 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._curve_actors: list[object] = []
         self._curve_hull_actors: list[object] = []
         self._curve_point_actors: list[object] = []
+        self._curve_actor_to_curve_id: dict[int, int] = {}
+        self._is_syncing_curve_selection_ui = False
+        self._major_sections: list[object] = []
+        self._section_lru: list[object] = []
+        self._max_expanded_sections = 3
+        self._is_updating_section_state = False
 
         self._selected_control_flat_index: int | None = None
         self._selected_curve_point_widget_index: int | None = None
@@ -186,6 +278,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._build_curve_group(panel_layout)
         self._build_control_point_group(panel_layout)
         self._build_surface_generation_group(panel_layout)
+        self._build_surface_operations_group(panel_layout)
         self._build_toolpath_group(panel_layout)
         self._build_export_group(panel_layout)
 
@@ -194,7 +287,94 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel("Ready")
         panel_layout.addWidget(self.status_label)
         panel_layout.addStretch(1)
+        self._enforce_max_expanded_sections(None)
         self._sync_ui_enabled_state()
+
+    def _set_section_collapsed_state(self, section_group: object, expanded: bool) -> None:
+        """Apply expanded/collapsed visual state to one major section group."""
+        if QtWidgets is None:
+            return
+
+        title_height = max(28, int(section_group.fontMetrics().height()) + 12)
+        if expanded:
+            section_group.setMaximumHeight(16777215)
+            section_group.setMinimumHeight(0)
+        else:
+            section_group.setMaximumHeight(title_height)
+            section_group.setMinimumHeight(title_height)
+
+    def _register_major_section(self, section_group: object, expanded_by_default: bool) -> None:
+        """Register one major GUI section as collapsible and LRU-managed."""
+        if QtWidgets is None:
+            return
+
+        section_group.setCheckable(True)
+        section_group.setChecked(bool(expanded_by_default))
+        self._set_section_collapsed_state(section_group, expanded=bool(expanded_by_default))
+        section_group.toggled.connect(
+            lambda checked, group=section_group: self._on_major_section_toggled(group, bool(checked))
+        )
+
+        self._major_sections.append(section_group)
+        if expanded_by_default:
+            self._section_lru.append(section_group)
+
+    def _on_major_section_toggled(self, section_group: object, expanded: bool) -> None:
+        """Track section usage and enforce maximum simultaneous expanded sections."""
+        if self._is_updating_section_state:
+            return
+
+        self._set_section_collapsed_state(section_group, expanded=bool(expanded))
+        if expanded:
+            if section_group in self._section_lru:
+                self._section_lru.remove(section_group)
+            self._section_lru.append(section_group)
+        else:
+            self._section_lru = [group for group in self._section_lru if group is not section_group]
+
+        self._enforce_max_expanded_sections(section_group if expanded else None)
+
+    def _enforce_max_expanded_sections(self, newly_expanded_group: object | None) -> None:
+        """Collapse least-recently-used expanded sections until limit is respected."""
+        expanded_groups = [group for group in self._major_sections if group.isChecked()]
+        if len(expanded_groups) <= self._max_expanded_sections:
+            return
+
+        focus_widget = None
+        if QtWidgets is not None and hasattr(QtWidgets, "QApplication"):
+            focus_widget = QtWidgets.QApplication.focusWidget()
+
+        self._is_updating_section_state = True
+        try:
+            while len([group for group in self._major_sections if group.isChecked()]) > self._max_expanded_sections:
+                candidate = None
+                for group in self._section_lru:
+                    if not group.isChecked():
+                        continue
+                    if newly_expanded_group is not None and group is newly_expanded_group:
+                        continue
+                    if focus_widget is not None and group.isAncestorOf(focus_widget):
+                        continue
+                    candidate = group
+                    break
+
+                if candidate is None:
+                    for group in self._section_lru:
+                        if not group.isChecked():
+                            continue
+                        if newly_expanded_group is not None and group is newly_expanded_group:
+                            continue
+                        candidate = group
+                        break
+
+                if candidate is None:
+                    break
+
+                candidate.setChecked(False)
+                self._set_section_collapsed_state(candidate, expanded=False)
+                self._section_lru = [group for group in self._section_lru if group is not candidate]
+        finally:
+            self._is_updating_section_state = False
 
     def _has_active_surface(self) -> bool:
         """Return True when an editable surface is currently available.
@@ -267,6 +447,11 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             "surface_extrude_axis_combo",
             "surface_extrude_height_spin",
             "surface_extrude_layers_spin",
+            "surface_selector_combo",
+            "surface_extrusion_mode_combo",
+            "surface_normal_extrude_distance_spin",
+            "surface_normal_replace_checkbox",
+            "extrude_selected_surface_button",
         )
         if not all(hasattr(self, name) for name in required_widgets):
             return
@@ -293,6 +478,14 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.surface_extrude_axis_combo.setEnabled(use_extrude_source)
         self.surface_extrude_height_spin.setEnabled(use_extrude_source)
         self.surface_extrude_layers_spin.setEnabled(use_extrude_source)
+        extrusion_mode = str(self.surface_extrusion_mode_combo.currentData())
+        self.surface_selector_combo.setEnabled(bool(self.surface_entries))
+        self.surface_extrusion_mode_combo.setEnabled(has_surface)
+        self.surface_normal_extrude_distance_spin.setEnabled(has_surface)
+        self.surface_normal_replace_checkbox.setEnabled(has_surface and extrusion_mode == "offset")
+        self.extrude_selected_surface_button.setEnabled(
+            has_surface and float(self.surface_normal_extrude_distance_spin.value()) > 0.0
+        )
 
         self.control_point_group.setEnabled(has_surface)
         self.generate_surface_button.setEnabled(self._has_valid_surface_input())
@@ -391,7 +584,9 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addLayout(interaction_row)
 
         self.curve_list_widget = QtWidgets.QListWidget()
+        self.curve_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.curve_list_widget.currentRowChanged.connect(self._on_curve_selection_changed)
+        self.curve_list_widget.itemSelectionChanged.connect(self._on_curve_list_item_selection_changed)
         layout.addWidget(self.curve_list_widget)
 
         curve_button_row = QtWidgets.QHBoxLayout()
@@ -437,6 +632,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addLayout(editor_form)
 
         parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=True)
         self._on_curve_type_changed(self.curve_type_combo.currentText())
         self._refresh_curve_list_widget()
 
@@ -447,6 +643,133 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if isinstance(curve, BSplineCurve):
             return "B-spline"
         return "NURBS"
+
+    def _curve_index_from_id(self, curve_id: int | None) -> int | None:
+        """Return curve index for one stable curve id."""
+        if curve_id is None:
+            return None
+        for curve_index, known_id in enumerate(self.curve_ids):
+            if known_id == int(curve_id):
+                return curve_index
+        return None
+
+    def _curve_id_from_index(self, curve_index: int | None) -> int | None:
+        """Return stable curve id from one curve index."""
+        if curve_index is None:
+            return None
+        if 0 <= int(curve_index) < len(self.curve_ids):
+            return int(self.curve_ids[int(curve_index)])
+        return None
+
+    def _allocate_curve_id(self) -> int:
+        """Allocate and return one new unique curve id."""
+        curve_id = int(self._next_curve_id)
+        self._next_curve_id += 1
+        return curve_id
+
+    def _sync_active_curve_index_from_selection(self) -> None:
+        """Mirror id-based curve selection state into legacy index fields."""
+        previous_active_index = self.active_curve_index
+        self.active_curve_index = self._curve_index_from_id(self.active_curve_id)
+        active_curve = self._get_active_curve()
+        if active_curve is None:
+            self.active_curve_point_index = None
+            return
+
+        if previous_active_index != self.active_curve_index:
+            self.active_curve_point_index = 0 if self._curve_point_count(active_curve) > 0 else None
+            return
+
+        if self.active_curve_point_index is None:
+            self.active_curve_point_index = 0 if self._curve_point_count(active_curve) > 0 else None
+            return
+
+        if not (0 <= int(self.active_curve_point_index) < self._curve_point_count(active_curve)):
+            self.active_curve_point_index = 0 if self._curve_point_count(active_curve) > 0 else None
+
+    def _apply_curve_selection_action(self, clicked_curve_id: int | None, shift_pressed: bool) -> None:
+        """Apply one viewport/list click action to curve selection state."""
+        (
+            self.selected_curve_ids,
+            self.active_curve_id,
+            self._last_interacted_curve_id,
+        ) = reduce_curve_selection_state(
+            valid_curve_ids=self.curve_ids,
+            selected_curve_ids=self.selected_curve_ids,
+            active_curve_id=self.active_curve_id,
+            last_interacted_curve_id=self._last_interacted_curve_id,
+            clicked_curve_id=clicked_curve_id,
+            shift_pressed=bool(shift_pressed),
+        )
+        self._sync_active_curve_index_from_selection()
+
+    def _sanitize_curve_selection_after_model_change(self) -> None:
+        """Drop stale curve references from selection state after model changes."""
+        (
+            self.selected_curve_ids,
+            self.active_curve_id,
+            self._last_interacted_curve_id,
+        ) = sanitize_curve_selection_state(
+            valid_curve_ids=self.curve_ids,
+            selected_curve_ids=self.selected_curve_ids,
+            active_curve_id=self.active_curve_id,
+            last_interacted_curve_id=self._last_interacted_curve_id,
+        )
+        self._sync_active_curve_index_from_selection()
+
+    def _sync_curve_selection_ui_from_state(self) -> None:
+        """Push internal curve selection state into the curve list widget."""
+        if not hasattr(self, "curve_list_widget"):
+            return
+
+        self._is_syncing_curve_selection_ui = True
+        try:
+            blocked = self.curve_list_widget.blockSignals(True)
+            for curve_index, curve_id in enumerate(self.curve_ids):
+                item = self.curve_list_widget.item(curve_index)
+                if item is None:
+                    continue
+                item.setSelected(curve_id in self.selected_curve_ids)
+
+            if self.active_curve_index is None:
+                self.curve_list_widget.setCurrentRow(-1)
+            else:
+                self.curve_list_widget.setCurrentRow(int(self.active_curve_index))
+            self.curve_list_widget.blockSignals(blocked)
+        finally:
+            self._is_syncing_curve_selection_ui = False
+
+    def _sync_curve_selection_state_from_list_widget(self) -> None:
+        """Pull curve selection state from list widget selection/current row."""
+        if self._is_syncing_curve_selection_ui:
+            return
+
+        selected_rows = sorted(
+            {
+                int(model_index.row())
+                for model_index in self.curve_list_widget.selectedIndexes()
+                if 0 <= int(model_index.row()) < len(self.curve_ids)
+            }
+        )
+
+        selected_ids = {self.curve_ids[row] for row in selected_rows}
+        current_row = int(self.curve_list_widget.currentRow())
+        current_id = self._curve_id_from_index(current_row)
+
+        if current_id is not None and current_id in selected_ids:
+            active_id = current_id
+        elif self._last_interacted_curve_id is not None and self._last_interacted_curve_id in selected_ids:
+            active_id = self._last_interacted_curve_id
+        else:
+            active_id = next((self.curve_ids[row] for row in selected_rows), None)
+
+        self.selected_curve_ids = selected_ids
+        self.active_curve_id = active_id
+        if active_id is not None:
+            self._last_interacted_curve_id = active_id
+
+        self._sanitize_curve_selection_after_model_change()
+        self._sync_curve_selection_ui_from_state()
 
     def _get_active_curve(self) -> CurveObject | None:
         """Return currently selected curve instance, if any."""
@@ -470,14 +793,156 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         z_values = np.zeros(count, dtype=float)
         return np.column_stack((x_values, y_values, z_values))
 
+    def _refresh_surface_selector_widget(self) -> None:
+        """Refresh active-surface selector entries from surface registry state."""
+        if not hasattr(self, "surface_selector_combo"):
+            return
+
+        blocked = self.surface_selector_combo.blockSignals(True)
+        self.surface_selector_combo.clear()
+        for entry in self.surface_entries:
+            name = str(entry.get("name", "Surface"))
+            surface_id = int(entry["surface_id"])
+            self.surface_selector_combo.addItem(name, surface_id)
+
+        if self.active_surface_id is not None:
+            active_index = self.surface_selector_combo.findData(int(self.active_surface_id))
+            if active_index >= 0:
+                self.surface_selector_combo.setCurrentIndex(int(active_index))
+        self.surface_selector_combo.blockSignals(blocked)
+
+    def _set_active_surface(self, surface_id: int | None) -> bool:
+        """Set one active surface from registry and sync compatibility bridge."""
+        previous_surface_id = self.active_surface_id
+        if surface_id is None:
+            self.active_surface_id = None
+            self.surface = None
+            self._invalidate_active_surface_render_cache()
+            self._refresh_surface_selector_widget()
+            self._configure_control_editor_ranges()
+            self._sync_spin_boxes_from_state()
+            self._sync_ui_enabled_state()
+            return True
+
+        for entry in self.surface_entries:
+            if int(entry["surface_id"]) != int(surface_id):
+                continue
+            self.active_surface_id = int(surface_id)
+            self.surface = entry["surface"]
+            if previous_surface_id != self.active_surface_id:
+                self._invalidate_active_surface_render_cache()
+            self._refresh_surface_selector_widget()
+            self._configure_control_editor_ranges()
+            self._sync_spin_boxes_from_state()
+            self._sync_ui_enabled_state()
+            return True
+        return False
+
+    def _invalidate_active_surface_render_cache(self) -> None:
+        """Drop cached active-surface render objects so next refresh rebuilds them."""
+        self._rendered_surface_id = None
+        if self._surface_actor is not None:
+            self.plotter.remove_actor(self._surface_actor)
+            self._surface_actor = None
+        self._surface_mesh = None
+
+        if self._control_net_actor is not None:
+            self.plotter.remove_actor(self._control_net_actor)
+            self._control_net_actor = None
+        self._control_net_mesh = None
+
+    def _register_surface_entry(
+        self,
+        surface_object: object,
+        name: str,
+        operation_tag: str,
+        source_surface_id: int | None = None,
+        set_active: bool = True,
+    ) -> int:
+        """Register one surface in scene registry and optionally activate it."""
+        surface_id = int(self._next_surface_id)
+        self._next_surface_id += 1
+
+        entry = {
+            "surface_id": surface_id,
+            "name": str(name),
+            "surface": surface_object,
+            "source_surface_id": source_surface_id,
+            "operation_tag": str(operation_tag),
+        }
+        self.surface_entries.append(entry)
+
+        if set_active:
+            self._set_active_surface(surface_id)
+        else:
+            self._refresh_surface_selector_widget()
+        return surface_id
+
+    def _clear_surface_registry(self) -> None:
+        """Clear all registered surfaces and active-surface compatibility state."""
+        self.surface_entries.clear()
+        self._set_active_surface(None)
+        self._rendered_surface_id = None
+
+    def _register_derived_body_entry(
+        self,
+        vertices: np.ndarray,
+        triangles: np.ndarray,
+        name: str,
+        mode: str,
+        source_surface_id: int | None,
+    ) -> None:
+        """Store one derived extrusion body for persistent viewport rendering."""
+        self._derived_body_entries.append(
+            {
+                "name": str(name),
+                "mode": str(mode),
+                "source_surface_id": source_surface_id,
+                "vertices": np.asarray(vertices, dtype=float).copy(),
+                "triangles": np.asarray(triangles, dtype=np.int64).copy(),
+            }
+        )
+
+    def _clear_derived_body_actors(self) -> None:
+        """Remove all rendered derived-body actors from viewport."""
+        for actor in self._derived_body_actors:
+            self.plotter.remove_actor(actor)
+        self._derived_body_actors.clear()
+
+    def _draw_derived_body_overlays(self) -> None:
+        """Render all stored shell/solid extrusion bodies as triangulated meshes."""
+        self._clear_derived_body_actors()
+
+        for body_entry in self._derived_body_entries:
+            vertices = np.asarray(body_entry["vertices"], dtype=float)
+            triangles = np.asarray(body_entry["triangles"], dtype=np.int64)
+            if vertices.ndim != 2 or vertices.shape[1] != 3 or triangles.ndim != 2 or triangles.shape[1] != 3:
+                continue
+
+            mesh = self._create_polydata_from_triangles(vertices, triangles)
+            if mesh is None:
+                continue
+
+            color = "#38bdf8" if str(body_entry["mode"]) == "solid" else "#34d399"
+            actor = self.plotter.add_mesh(
+                mesh,
+                color=color,
+                opacity=0.42,
+                show_edges=True,
+                edge_color="#0f172a",
+                line_width=1,
+            )
+            self._derived_body_actors.append(actor)
+
     def _invalidate_generated_geometry_from_curve_edit(self) -> None:
         """Invalidate dependent generated geometry when source curves change."""
         self.generated_passes = []
         self._clear_toolpath_actors()
+        self._derived_body_entries.clear()
+        self._clear_derived_body_actors()
 
-        if self._has_active_surface():
-            self.surface = None
-            self._configure_control_editor_ranges()
+        if self.surface_entries or self._has_active_surface():
+            self._clear_surface_registry()
 
     def _create_curve_from_inputs(self, curve_type: str) -> CurveObject:
         """Create a new curve from current curve panel settings."""
@@ -523,16 +988,21 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
     def _refresh_curve_list_widget(self) -> None:
         """Refresh curve list widget contents from current curve collection."""
+        self._sanitize_curve_selection_after_model_change()
+
         blocked = self.curve_list_widget.blockSignals(True)
         self.curve_list_widget.clear()
 
         for curve_index, curve in enumerate(self.curves):
-            label = f"{curve_index + 1}: {self._curve_type_name(curve)} ({self._curve_point_count(curve)} pts)"
+            curve_id = self.curve_ids[curve_index] if curve_index < len(self.curve_ids) else -1
+            label = (
+                f"{curve_index + 1}: {self._curve_type_name(curve)} "
+                f"({self._curve_point_count(curve)} pts) [id={curve_id}]"
+            )
             self.curve_list_widget.addItem(label)
-
-        if self.active_curve_index is not None and 0 <= self.active_curve_index < len(self.curves):
-            self.curve_list_widget.setCurrentRow(self.active_curve_index)
         self.curve_list_widget.blockSignals(blocked)
+
+        self._sync_curve_selection_ui_from_state()
 
         self._refresh_curve_point_list_widget()
 
@@ -858,6 +1328,12 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 self._is_syncing_curve_widgets = False
 
         self.active_curve_point_index = point_index
+        active_curve_id = self._curve_id_from_index(self.active_curve_index)
+        if active_curve_id is not None:
+            self.active_curve_id = active_curve_id
+            self.selected_curve_ids.add(active_curve_id)
+            self._last_interacted_curve_id = active_curve_id
+            self._sync_active_curve_index_from_selection()
         self._set_selected_curve_point_widget(point_index)
 
         if self.generated_passes:
@@ -870,8 +1346,66 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(f"Dragging curve point P{point_index}")
         self.plotter.render()
 
+    def _is_shift_modifier_active(self) -> bool:
+        """Return True when shift modifier is active for current interactor event."""
+        try:
+            if QtWidgets is not None and QtCore is not None and hasattr(QtWidgets, "QApplication"):
+                modifiers = QtWidgets.QApplication.keyboardModifiers()
+                if int(modifiers & QtCore.Qt.ShiftModifier):
+                    return True
+
+            interactor = getattr(self.plotter.iren, "interactor", None)
+            if interactor is not None and hasattr(interactor, "GetShiftKey"):
+                return bool(interactor.GetShiftKey())
+            if hasattr(self.plotter.iren, "GetShiftKey"):
+                return bool(self.plotter.iren.GetShiftKey())
+        except Exception:
+            return False
+        return False
+
+    def _pick_curve_id_at_click(self, display_position: tuple[float, float]) -> int | None:
+        """Pick one rendered curve actor and return mapped curve id if available."""
+        if not self._curve_actor_to_curve_id:
+            return None
+
+        if pv is None:
+            return None
+
+        try:
+            picker = pv._vtk.vtkPropPicker()
+            x_pos, y_pos = display_position
+            picked = int(picker.Pick(float(x_pos), float(y_pos), 0.0, self.plotter.renderer))
+            if picked != 1:
+                return None
+
+            picked_actor = picker.GetActor()
+            if picked_actor is not None:
+                mapped_id = self._curve_actor_to_curve_id.get(id(picked_actor))
+                if mapped_id is not None:
+                    return mapped_id
+
+            picked_prop = picker.GetViewProp()
+            if picked_prop is not None:
+                return self._curve_actor_to_curve_id.get(id(picked_prop))
+        except Exception:
+            return None
+        return None
+
     def _on_viewport_left_click(self, display_position: tuple[float, float]) -> None:
-        """Handle left-click curve point placement in viewport add mode."""
+        """Handle left-click actions for curve selection and add-point workflows."""
+        if self._curve_interaction_mode == "select":
+            curve_id = self._pick_curve_id_at_click(display_position)
+            shift_pressed = self._is_shift_modifier_active()
+            self._apply_curve_selection_action(curve_id, shift_pressed=shift_pressed)
+            self._refresh_curve_list_widget()
+            self._sync_ui_enabled_state()
+            self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+            if curve_id is None:
+                self.status_label.setText("Curve selection cleared")
+            elif self.active_curve_id is not None:
+                self.status_label.setText(f"Selected curve id={self.active_curve_id}")
+            return
+
         if self._curve_interaction_mode != "add":
             return
 
@@ -913,6 +1447,11 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._is_curve_dragging = True
         self._curve_drag_point_index = nearest_index
         self.active_curve_point_index = nearest_index
+        active_curve_id = self._curve_id_from_index(self.active_curve_index)
+        if active_curve_id is not None:
+            self.active_curve_id = active_curve_id
+            self.selected_curve_ids.add(active_curve_id)
+            self._last_interacted_curve_id = active_curve_id
 
         self._invalidate_generated_geometry_from_curve_edit()
         self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
@@ -975,10 +1514,12 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         if isinstance(curve, BezierCurve):
             knot_mode = "uniform"
 
+        curve_id = self._allocate_curve_id()
         self.curves.append(curve)
+        self.curve_ids.append(curve_id)
         self.curve_knot_modes.append(knot_mode)
-        self.active_curve_index = len(self.curves) - 1
-        self.active_curve_point_index = 0
+        self._apply_curve_selection_action(curve_id, shift_pressed=False)
+        self.active_curve_point_index = 0 if self._curve_point_count(curve) > 0 else None
 
         self._invalidate_generated_geometry_from_curve_edit()
         self._refresh_curve_list_widget()
@@ -993,14 +1534,9 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             return
 
         del self.curves[self.active_curve_index]
+        del self.curve_ids[self.active_curve_index]
         del self.curve_knot_modes[self.active_curve_index]
-
-        if not self.curves:
-            self.active_curve_index = None
-            self.active_curve_point_index = None
-        else:
-            self.active_curve_index = min(self.active_curve_index, len(self.curves) - 1)
-            self.active_curve_point_index = 0
+        self._sanitize_curve_selection_after_model_change()
 
         self._invalidate_generated_geometry_from_curve_edit()
         self._refresh_curve_list_widget()
@@ -1008,15 +1544,32 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
         self.status_label.setText("Curve deleted")
 
+    def _on_curve_list_item_selection_changed(self) -> None:
+        """Handle multi-selection updates initiated from curve list widget."""
+        self._sync_curve_selection_state_from_list_widget()
+        self._sync_curve_selection_ui_from_state()
+        self._refresh_curve_point_list_widget()
+        self._sync_ui_enabled_state()
+        self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
+
     def _on_curve_selection_changed(self, row: int) -> None:
         """Handle active curve selection changes from list widget."""
-        if row < 0 or row >= len(self.curves):
-            self.active_curve_index = None
-            self.active_curve_point_index = None
-        else:
-            self.active_curve_index = int(row)
-            self.active_curve_point_index = 0
+        if self._is_syncing_curve_selection_ui:
+            return
 
+        if row < 0 or row >= len(self.curves):
+            self.active_curve_id = None
+            self._sanitize_curve_selection_after_model_change()
+        else:
+            row_curve_id = self._curve_id_from_index(int(row))
+            if row_curve_id is not None and row_curve_id in self.selected_curve_ids:
+                self.active_curve_id = row_curve_id
+                self._last_interacted_curve_id = row_curve_id
+                self._sanitize_curve_selection_after_model_change()
+            else:
+                self._sync_curve_selection_state_from_list_widget()
+
+        self._sync_curve_selection_ui_from_state()
         self._refresh_curve_point_list_widget()
         self._sync_ui_enabled_state()
         self._refresh_scene(reset_camera=False, recompute_surface=False, redraw_toolpath=False)
@@ -1222,6 +1775,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addRow(self.apply_point_button)
 
         parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=True)
         self._configure_control_editor_ranges()
         self._sync_spin_boxes_from_state()
 
@@ -1239,6 +1793,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             surface creation explicit through a dedicated action button.
         """
         group = QtWidgets.QGroupBox("Surface Generation")
+        self.surface_generation_group = group
         layout = QtWidgets.QFormLayout(group)
 
         self.surface_source_combo = QtWidgets.QComboBox()
@@ -1297,10 +1852,128 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addRow(self.generate_surface_button)
 
         parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=True)
 
     def _on_surface_source_changed(self, _index: int) -> None:
         """React to surface-source mode changes in generation controls."""
         self._sync_ui_enabled_state()
+
+    def _build_surface_operations_group(self, parent_layout) -> None:
+        """Create widgets for non-destructive active-surface operations."""
+        group = QtWidgets.QGroupBox("Surface Operations")
+        self.surface_operations_group = group
+        layout = QtWidgets.QFormLayout(group)
+
+        self.surface_selector_combo = QtWidgets.QComboBox()
+        self.surface_selector_combo.currentIndexChanged.connect(self._on_surface_selector_changed)
+
+        self.surface_extrusion_mode_combo = QtWidgets.QComboBox()
+        self.surface_extrusion_mode_combo.addItem("Surface Offset (Legacy)", "offset")
+        self.surface_extrusion_mode_combo.addItem("Shell Extrusion (Hollow)", "shell")
+        self.surface_extrusion_mode_combo.addItem("Full Solid Extrusion", "solid")
+        self.surface_extrusion_mode_combo.currentIndexChanged.connect(self._sync_ui_enabled_state)
+
+        self.surface_normal_extrude_distance_spin = QtWidgets.QDoubleSpinBox()
+        self.surface_normal_extrude_distance_spin.setRange(0.1, 500.0)
+        self.surface_normal_extrude_distance_spin.setValue(12.0)
+        self.surface_normal_extrude_distance_spin.setDecimals(3)
+        self.surface_normal_extrude_distance_spin.valueChanged.connect(
+            lambda _value: self._sync_ui_enabled_state()
+        )
+
+        self.surface_normal_replace_checkbox = QtWidgets.QCheckBox("Replace active surface (offset mode only)")
+        self.surface_normal_replace_checkbox.setChecked(False)
+
+        self.extrude_selected_surface_button = QtWidgets.QPushButton("Extrude Selected Surface")
+        self.extrude_selected_surface_button.clicked.connect(self._on_extrude_selected_surface)
+
+        layout.addRow("Active surface", self.surface_selector_combo)
+        layout.addRow("Extrusion mode", self.surface_extrusion_mode_combo)
+        layout.addRow("Extrude distance", self.surface_normal_extrude_distance_spin)
+        layout.addRow(self.surface_normal_replace_checkbox)
+        layout.addRow(self.extrude_selected_surface_button)
+
+        parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=False)
+        self._refresh_surface_selector_widget()
+
+    def _on_surface_selector_changed(self, _index: int) -> None:
+        """Set active surface from selector and refresh dependent viewport/UI."""
+        selected_surface_id = self.surface_selector_combo.currentData()
+        if selected_surface_id is None:
+            return
+        if not self._set_active_surface(int(selected_surface_id)):
+            return
+
+        self.generated_passes = []
+        self._clear_toolpath_actors()
+        self._refresh_scene(reset_camera=False, recompute_surface=True, redraw_toolpath=False)
+
+    def _on_extrude_selected_surface(self) -> None:
+        """Generate derived geometry from active surface with selected extrusion mode."""
+        if not self._has_active_surface():
+            self.status_label.setText("Select or generate a surface before extrusion")
+            return
+
+        distance = float(self.surface_normal_extrude_distance_spin.value())
+        if distance <= 0.0:
+            self.status_label.setText("Extrusion distance must be positive")
+            return
+
+        source_surface_id = self.active_surface_id
+        source_surface = self.surface
+        if source_surface is None:
+            self.status_label.setText("No active surface available for extrusion")
+            return
+
+        extrusion_mode = str(self.surface_extrusion_mode_combo.currentData())
+        try:
+            if extrusion_mode == "offset":
+                derived_surface = extrude_surface_along_center_normal(source_surface, distance=distance)
+                if self.surface_normal_replace_checkbox.isChecked() and source_surface_id is not None:
+                    for entry in self.surface_entries:
+                        if int(entry["surface_id"]) != int(source_surface_id):
+                            continue
+                        entry["surface"] = derived_surface
+                        entry["operation_tag"] = "surface-normal-extrude-replace"
+                        entry["name"] = f"Surface {source_surface_id} (normal extrude)"
+                        break
+                    self._invalidate_active_surface_render_cache()
+                    self._set_active_surface(source_surface_id)
+                else:
+                    base_name = "Surface normal extrusion"
+                    self._register_surface_entry(
+                        surface_object=derived_surface,
+                        name=f"{base_name} {self._next_surface_id}",
+                        operation_tag="surface-normal-extrude",
+                        source_surface_id=source_surface_id,
+                        set_active=True,
+                    )
+                status_text = "Derived offset surface generated from active surface normal"
+            else:
+                vertices, triangles = build_surface_extrusion_mesh(
+                    source_surface,
+                    distance=distance,
+                    mode=extrusion_mode,
+                    u_samples=DEFAULT_SURFACE_SAMPLES_U,
+                    v_samples=DEFAULT_SURFACE_SAMPLES_V,
+                )
+                self._register_derived_body_entry(
+                    vertices=vertices,
+                    triangles=triangles,
+                    name=f"{extrusion_mode.title()} Body {len(self._derived_body_entries) + 1}",
+                    mode=extrusion_mode,
+                    source_surface_id=source_surface_id,
+                )
+                status_text = f"Generated {extrusion_mode} extrusion body from active surface"
+        except ValueError as error:
+            self.status_label.setText(f"Surface extrusion failed: {error}")
+            return
+
+        self.generated_passes = []
+        self._clear_toolpath_actors()
+        self._refresh_scene(reset_camera=False, recompute_surface=True, redraw_toolpath=False)
+        self.status_label.setText(status_text)
 
     def _build_toolpath_group(self, parent_layout) -> None:
         """Create widgets for zig-zag toolpath generation parameters.
@@ -1316,6 +1989,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             that generate and draw cutter-location passes.
         """
         group = QtWidgets.QGroupBox("Toolpath")
+        self.toolpath_group = group
         layout = QtWidgets.QFormLayout(group)
 
         self.stepover_spin = QtWidgets.QDoubleSpinBox()
@@ -1336,6 +2010,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addRow(self.generate_toolpath_button)
 
         parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=False)
 
     def _build_export_group(self, parent_layout) -> None:
         """Create widgets for G-code settings and file export.
@@ -1351,6 +2026,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             toolpaths to a user-selected G-code file.
         """
         group = QtWidgets.QGroupBox("G-code Export")
+        self.export_group = group
         layout = QtWidgets.QFormLayout(group)
 
         self.feed_spin = QtWidgets.QDoubleSpinBox()
@@ -1382,6 +2058,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addRow(self.export_gcode_button)
 
         parent_layout.addWidget(group)
+        self._register_major_section(group, expanded_by_default=False)
 
     def _on_generate_surface(self) -> None:
         """Create a surface explicitly from the configured input dimensions.
@@ -1404,15 +2081,19 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
         try:
             if source_mode == "control-net":
-                self.surface = create_default_surface(
+                generated_surface = create_default_surface(
                     rows=int(self.surface_rows_spin.value()),
                     cols=int(self.surface_cols_spin.value()),
                 )
+                surface_name = f"Control Net Surface {self._next_surface_id}"
+                operation_tag = "control-net"
             elif source_mode == "curve-loft":
-                self.surface = loft_surface_from_curves(
+                generated_surface = loft_surface_from_curves(
                     self.curves,
                     samples_per_curve=int(self.surface_curve_samples_spin.value()),
                 )
+                surface_name = f"Loft Surface {self._next_surface_id}"
+                operation_tag = "curve-loft"
             else:
                 active_curve = self._get_active_curve()
                 if active_curve is None:
@@ -1426,16 +2107,26 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 }
                 axis_direction = axis_map.get(axis_key, np.array([0.0, 0.0, 1.0], dtype=float))
 
-                self.surface = extrude_surface_from_curve(
+                generated_surface = extrude_surface_from_curve(
                     active_curve,
                     direction=axis_direction,
                     height=float(self.surface_extrude_height_spin.value()),
                     layer_count=int(self.surface_extrude_layers_spin.value()),
                     samples_along_curve=int(self.surface_curve_samples_spin.value()),
                 )
+                surface_name = f"Curve Extrusion Surface {self._next_surface_id}"
+                operation_tag = "curve-extrude"
         except ValueError as error:
             self.status_label.setText(f"Surface generation failed: {error}")
             return
+
+        self._register_surface_entry(
+            surface_object=generated_surface,
+            name=surface_name,
+            operation_tag=operation_tag,
+            source_surface_id=None,
+            set_active=True,
+        )
 
         if self._curve_interaction_mode == "drag":
             select_index = self.curve_interaction_mode_combo.findData("select")
@@ -1449,8 +2140,6 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
         self.generated_passes = []
         self._clear_toolpath_actors()
-        self._configure_control_editor_ranges()
-        self._sync_spin_boxes_from_state()
         self._sync_ui_enabled_state()
         self._refresh_scene(reset_camera=True, recompute_surface=True, redraw_toolpath=False)
 
@@ -1803,6 +2492,8 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
     def _clear_curve_actors(self) -> None:
         """Remove all rendered curve, hull, and curve-point actors."""
+        self._curve_actor_to_curve_id.clear()
+
         for actor in self._curve_actors:
             self.plotter.remove_actor(actor)
         self._curve_actors.clear()
@@ -1820,23 +2511,36 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._clear_curve_actors()
 
         for curve_index, curve in enumerate(self.curves):
+            curve_id = self.curve_ids[curve_index] if curve_index < len(self.curve_ids) else curve_index
             control_points = np.asarray(curve.control_points, dtype=float)
             if control_points.shape[0] < 2:
                 continue
 
-            is_active = self.active_curve_index == curve_index
-            hull_color = "#f59e0b" if is_active else "#9ca3af"
-            curve_color = "#dc2626" if is_active else "#2563eb"
-            point_color = "#f97316" if is_active else "#475569"
+            is_active = self.active_curve_id == curve_id
+            is_selected = curve_id in self.selected_curve_ids
+            if is_active:
+                hull_color = "#f59e0b"
+                curve_color = "#dc2626"
+                point_color = "#f97316"
+            elif is_selected:
+                hull_color = "#a78bfa"
+                curve_color = "#6d28d9"
+                point_color = "#7c3aed"
+            else:
+                hull_color = "#9ca3af"
+                curve_color = "#2563eb"
+                point_color = "#475569"
 
             hull_mesh = pv.lines_from_points(control_points, close=False)
             hull_actor = self.plotter.add_mesh(hull_mesh, color=hull_color, line_width=2)
             self._curve_hull_actors.append(hull_actor)
+            self._curve_actor_to_curve_id[id(hull_actor)] = int(curve_id)
 
             sampled_points = curve.sample_points(120)
             curve_mesh = pv.lines_from_points(sampled_points, close=False)
             curve_actor = self.plotter.add_mesh(curve_mesh, color=curve_color, line_width=4)
             self._curve_actors.append(curve_actor)
+            self._curve_actor_to_curve_id[id(curve_actor)] = int(curve_id)
 
             points_actor = self.plotter.add_points(
                 control_points,
@@ -1845,6 +2549,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 render_points_as_spheres=True,
             )
             self._curve_point_actors.append(points_actor)
+            self._curve_actor_to_curve_id[id(points_actor)] = int(curve_id)
 
     def _clear_surface_visuals(self) -> None:
         """Remove all surface-derived actors/widgets while keeping scene helpers.
@@ -1870,6 +2575,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self._control_net_mesh = None
 
         self._selected_control_flat_index = None
+        self._rendered_surface_id = None
 
     def _estimate_reference_plane_extent(self) -> float:
         """Return a half-extent that keeps the XY reference plane usable.
@@ -1982,6 +2688,34 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             mesh.lines = np.asarray(lines, dtype=np.int64)
         return mesh
 
+    def _create_polydata_from_triangles(
+        self,
+        vertices: np.ndarray,
+        triangles: np.ndarray,
+    ) -> object | None:
+        """Build one PyVista PolyData from explicit triangle-index geometry."""
+        if pv is None:
+            return None
+
+        verts = np.asarray(vertices, dtype=float)
+        tris = np.asarray(triangles, dtype=np.int64)
+        if verts.ndim != 2 or verts.shape[1] != 3:
+            return None
+        if tris.ndim != 2 or tris.shape[1] != 3:
+            return None
+        if tris.size == 0:
+            return None
+        if np.min(tris) < 0 or np.max(tris) >= verts.shape[0]:
+            return None
+
+        faces = np.hstack(
+            (
+                np.full((tris.shape[0], 1), 3, dtype=np.int64),
+                tris,
+            )
+        ).ravel()
+        return pv.PolyData(verts, faces)
+
     def _update_surface_mesh_geometry(self) -> None:
         """Recompute and apply surface geometry on the existing mesh actor.
 
@@ -2000,7 +2734,14 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 self.plotter.remove_actor(self._surface_actor)
                 self._surface_actor = None
             self._surface_mesh = None
+            self._rendered_surface_id = None
             return
+
+        if self._rendered_surface_id != self.active_surface_id:
+            if self._surface_actor is not None:
+                self.plotter.remove_actor(self._surface_actor)
+                self._surface_actor = None
+            self._surface_mesh = None
 
         points, _, _, _ = self.surface.evaluate_grid(
             u_samples=DEFAULT_SURFACE_SAMPLES_U,
@@ -2019,6 +2760,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 show_edges=True,
                 edge_color="#2f4f6f",
             )
+            self._rendered_surface_id = self.active_surface_id
             return
 
         flat_points = np.column_stack(
@@ -2030,6 +2772,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         )
         self._surface_mesh.points = flat_points
         self._surface_mesh.Modified()
+        self._rendered_surface_id = self.active_surface_id
 
     def _update_control_net_geometry(self) -> None:
         """Update control-net line geometry and visibility state.
@@ -2130,6 +2873,7 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             self._clear_toolpath_actors()
 
         self._draw_curve_overlays()
+        self._draw_derived_body_overlays()
         self._ensure_active_widget_layer()
 
         if redraw_toolpath:
