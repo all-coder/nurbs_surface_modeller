@@ -7,8 +7,8 @@
 % ── Font: Times New Roman equivalent ──────────────────────────────────────────
 \usepackage{mathptmx}          % Times New Roman for body + math
 
-% ── Page Layout: 1-inch margins ───────────────────────────────────────────────
-\usepackage[a4paper, margin=1in]{geometry}
+% ── Page Layout: reduced left/right margins ───────────────────────────────────
+\usepackage[a4paper, left=0.75in, right=0.75in]{geometry}
 
 % ── Line Spacing: 1.15 ────────────────────────────────────────────────────────
 \usepackage{setspace}
@@ -507,37 +507,37 @@ for representative NURBS surfaces. The algorithm's key performance metrics are:
     by approximately 80\% compared to unidirectional scanning.
 \end{enumerate}
 
-\subsection{Quantitative Accuracy Evaluation}
+% \subsection{Quantitative Accuracy Evaluation}
 
-Table~\ref{tab:accuracy} compares theoretical surface values (computed using
-high-precision symbolic evaluation or numerical integration) against the
-modeller's discrete point evaluation at representative parameter values.
+% Table~\ref{tab:accuracy} compares theoretical surface values (computed using
+% high-precision symbolic evaluation or numerical integration) against the
+% modeller's discrete point evaluation at representative parameter values.
 
-\begin{table}[H]
-  \centering
-  \caption{Comparison of theoretical and computed NURBS surface points at
-           selected parameter values $(u, v)$. Surface: bi-cubic, 5×5 control
-           net, unit weights.}
-  \label{tab:accuracy}
-  \begin{tabular}{ccccc}
-    \toprule
-    \textbf{$u$} & \textbf{$v$} &
-    \textbf{Theoretical $Z$ (mm)} &
-    \textbf{Computed $Z$ (mm)} &
-    \textbf{Error (mm)} \\
-    \midrule
-    0.0 & 0.0 & 0.000 & 0.000 & 0.0000 \\
-    0.25 & 0.25 & 2.156 & 2.156 & 0.0001 \\
-    0.5 & 0.5 & 5.234 & 5.234 & 0.0002 \\
-    0.75 & 0.75 & 7.812 & 7.812 & 0.0001 \\
-    1.0 & 1.0 & 8.000 & 8.000 & 0.0000 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+% \begin{table}[H]
+%   \centering
+%   \caption{Comparison of theoretical and computed NURBS surface points at
+%            selected parameter values $(u, v)$. Surface: bi-cubic, 5×5 control
+%            net, unit weights.}
+%   \label{tab:accuracy}
+%   \begin{tabular}{ccccc}
+%     \toprule
+%     \textbf{$u$} & \textbf{$v$} &
+%     \textbf{Theoretical $Z$ (mm)} &
+%     \textbf{Computed $Z$ (mm)} &
+%     \textbf{Error (mm)} \\
+%     \midrule
+%     0.0 & 0.0 & 0.000 & 0.000 & 0.0000 \\
+%     0.25 & 0.25 & 2.156 & 2.156 & 0.0001 \\
+%     0.5 & 0.5 & 5.234 & 5.234 & 0.0002 \\
+%     0.75 & 0.75 & 7.812 & 7.812 & 0.0001 \\
+%     1.0 & 1.0 & 8.000 & 8.000 & 0.0000 \\
+%     \bottomrule
+%   \end{tabular}
+% \end{table}
 
-The maximum error across 25 test points was $< 0.0005~\text{mm}$, demonstrating
-excellent agreement between the Cox-de Boor basis function implementation and
-theoretical NURBS evaluation.
+% The maximum error across 25 test points was $< 0.0005~\text{mm}$, demonstrating
+% excellent agreement between the Cox-de Boor basis function implementation and
+% theoretical NURBS evaluation.
 
 \subsection{G-Code Export and CNC Compatibility}
 
