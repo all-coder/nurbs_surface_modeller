@@ -33,7 +33,12 @@ from gcode.exporter import (
     generate_gcode_program,
     write_gcode_file,
 )
-from machining.toolpath import ToolpathPass, generate_zigzag_toolpath
+from machining.toolpath import (
+    ToolpathPass,
+    #compute_toolpath_diagnostics,
+    generate_mesh_zigzag_toolpath,
+    generate_zigzag_toolpath,
+)
 from surface.factory import create_default_surface
 from surface.providers.extrusion import extrude_surface_from_curve
 from surface.providers.loft import loft_surface_from_curves
@@ -443,6 +448,9 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             "surface_curve_samples_spin",
             "generate_surface_button",
             "generate_toolpath_button",
+            "toolpath_source_combo",
+            "scan_axis_combo",
+            "mesh_envelope_combo",
             "export_gcode_button",
             "create_curve_button",
             "delete_curve_button",
@@ -496,7 +504,13 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
 
         self.control_point_group.setEnabled(has_surface)
         self.generate_surface_button.setEnabled(self._has_valid_surface_input())
-        self.generate_toolpath_button.setEnabled(has_surface)
+        toolpath_source = self.toolpath_source_combo.currentData()
+        use_mesh_toolpath = toolpath_source == "mesh"
+        has_body_mesh = self._get_latest_derived_body_entry() is not None
+        self.toolpath_source_combo.setEnabled(has_surface)
+        self.scan_axis_combo.setEnabled(has_surface)
+        self.mesh_envelope_combo.setEnabled(has_surface and use_mesh_toolpath)
+        self.generate_toolpath_button.setEnabled(has_surface and (not use_mesh_toolpath or has_body_mesh))
         self.export_gcode_button.setEnabled(has_surface and has_passes)
 
         self.create_curve_button.setEnabled(True)
@@ -858,6 +872,23 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             self._control_net_actor = None
         self._control_net_mesh = None
 
+    def _invalidate_derived_bodies_for_surface(self, surface_id: int | None) -> bool:
+        """Drop derived bodies that no longer match the updated surface."""
+        if surface_id is None:
+            return False
+
+        original_count = len(self._derived_body_entries)
+        self._derived_body_entries = [
+            entry
+            for entry in self._derived_body_entries
+            if entry.get("source_surface_id") != surface_id
+        ]
+        if len(self._derived_body_entries) == original_count:
+            return False
+
+        self._draw_derived_body_overlays()
+        return True
+
     def _register_surface_entry(
         self,
         surface_object: object,
@@ -909,6 +940,15 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                 "triangles": np.asarray(triangles, dtype=np.int64).copy(),
             }
         )
+
+    def _get_latest_derived_body_entry(self) -> dict[str, object] | None:
+        """Return the most recently generated derived body for the active surface."""
+        if self.active_surface_id is None:
+            return None
+        for entry in reversed(self._derived_body_entries):
+            if entry.get("source_surface_id") == self.active_surface_id:
+                return entry
+        return None
 
     def _clear_derived_body_actors(self) -> None:
         """Remove all rendered derived-body actors from viewport."""
@@ -2014,6 +2054,22 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.tolerance_spin.setValue(COLLINEAR_TOLERANCE_MM)
         self.tolerance_spin.setDecimals(3)
 
+        self.toolpath_source_combo = QtWidgets.QComboBox()
+        self.toolpath_source_combo.addItem("Surface (Parametric)", "surface")
+        self.toolpath_source_combo.addItem("Derived Body Mesh", "mesh")
+        self.toolpath_source_combo.currentIndexChanged.connect(self._sync_ui_enabled_state)
+
+        self.scan_axis_combo = QtWidgets.QComboBox()
+        self.scan_axis_combo.addItem("Auto (Adaptive)", "auto")
+        self.scan_axis_combo.addItem("Primary Axis (U / X)", "ux")
+        self.scan_axis_combo.addItem("Secondary Axis (V / Y)", "vy")
+        self.scan_axis_combo.currentIndexChanged.connect(self._sync_ui_enabled_state)
+
+        self.mesh_envelope_combo = QtWidgets.QComboBox()
+        self.mesh_envelope_combo.addItem("Top Envelope (Max Z)", "top")
+        self.mesh_envelope_combo.addItem("Full Envelope (Top+Bottom)", "full")
+        self.mesh_envelope_combo.currentIndexChanged.connect(self._sync_ui_enabled_state)
+
         self.link_passes_check = QtWidgets.QCheckBox("Link passes on surface (G1)")
         self.link_passes_check.setChecked(False)
 
@@ -2023,6 +2079,9 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         layout.addRow("Stepover (mm)", self.stepover_spin)
         layout.addRow("Tool radius (mm)", self.radius_spin)
         layout.addRow("Chord tolerance (mm)", self.tolerance_spin)
+        layout.addRow("Toolpath source", self.toolpath_source_combo)
+        layout.addRow("Scan axis", self.scan_axis_combo)
+        layout.addRow("Mesh envelope", self.mesh_envelope_combo)
         layout.addRow("Pass linking", self.link_passes_check)
         layout.addRow(self.generate_toolpath_button)
 
@@ -2288,6 +2347,8 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         except (IndexError, ValueError) as error:
             self.status_label.setText(f"Control-point update failed: {error}")
             return
+
+        self._invalidate_derived_bodies_for_surface(self.active_surface_id)
 
         flat_index = self._uv_to_flat_index(i_u, i_v)
         self._set_selected_control_point(flat_index)
@@ -2920,20 +2981,56 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("Generate a surface before generating toolpath")
             return
 
-        self.generated_passes = generate_zigzag_toolpath(
-            surface=self.surface,
-            stepover_mm=float(self.stepover_spin.value()),
-            tool_radius_mm=float(self.radius_spin.value()),
-            tolerance_mm=float(self.tolerance_spin.value()),
-            link_passes=self.link_passes_check.isChecked(),
-        )
+        toolpath_source = self.toolpath_source_combo.currentData()
+        axis_mode = str(self.scan_axis_combo.currentData())
+        surface_scan_axis = {"auto": "auto", "ux": "u", "vy": "v"}.get(axis_mode, "auto")
+        mesh_scan_axis = {"auto": "auto", "ux": "x", "vy": "y"}.get(axis_mode, "auto")
+        try:
+            if toolpath_source == "mesh":
+                body_entry = self._get_latest_derived_body_entry()
+                if body_entry is None:
+                    self.status_label.setText("Generate a solid/shell body before mesh toolpath")
+                    return
+
+                self.generated_passes = generate_mesh_zigzag_toolpath(
+                    vertices=body_entry["vertices"],
+                    triangles=body_entry["triangles"],
+                    stepover_mm=float(self.stepover_spin.value()),
+                    tool_radius_mm=float(self.radius_spin.value()),
+                    tolerance_mm=float(self.tolerance_spin.value()),
+                    link_passes=self.link_passes_check.isChecked(),
+                    envelope_mode=str(self.mesh_envelope_combo.currentData()),
+                    # scan_axis=mesh_scan_axis,
+                )
+            else:
+                self.generated_passes = generate_zigzag_toolpath(
+                    surface=self.surface,
+                    stepover_mm=float(self.stepover_spin.value()),
+                    tool_radius_mm=float(self.radius_spin.value()),
+                    tolerance_mm=float(self.tolerance_spin.value()),
+                    link_passes=self.link_passes_check.isChecked(),
+                    scan_axis=surface_scan_axis,
+                )
+        except ValueError as error:
+            self.status_label.setText(f"Toolpath generation failed: {error}")
+            return
         self._refresh_scene(reset_camera=False)
         self._sync_ui_enabled_state()
 
-        total_points = sum(len(item.points) for item in self.generated_passes)
-        self.status_label.setText(
-            f"Generated {len(self.generated_passes)} passes with {total_points} CL points"
-        )
+        #diagnostics = compute_toolpath_diagnostics(self.generated_passes)
+        #total_points = diagnostics.point_count
+        source_label = "mesh" if toolpath_source == "mesh" else "surface"
+        #resolved_scan_axis = diagnostics.scan_axis or "n/a"
+        # fixed_axis_name = (
+        #     self.generated_passes[0].fixed_axis_name
+        #     if self.generated_passes and self.generated_passes[0].points
+        #     else "n/a"
+        # )
+        # self.status_label.setText(
+        #     #f"Generated {len(self.generated_passes)} {source_label} passes with {total_points} CL points | "
+        #     # f"scan {resolved_scan_axis} (fixed {fixed_axis_name}) | "
+        #     # f"flat {diagnostics.flat_pass_count}/{diagnostics.evaluated_pass_count}"
+        # )
 
     def _draw_toolpath_overlay(self) -> None:
         """Draw generated toolpath passes as line segments in the 3D viewport.
