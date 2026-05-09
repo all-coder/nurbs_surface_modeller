@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from config import (
     COLLINEAR_TOLERANCE_MM,
+    DEFAULT_LINK_SAMPLES,
     DEFAULT_TOOLPATH_SAMPLES_U,
     EPSILON,
 )
 from surface.nurbs_surface import NURBSSurface
-from utils.geometry import normalize_vector, point_line_deviation
+from utils.geometry import point_line_deviation
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class ToolpathPass:
     v_parameter: float
     direction: str
     points: list[ToolpathPoint]
+    link_points: list[ToolpathPoint] = field(default_factory=list)
 
 
 def estimate_v_step_from_mm(
@@ -121,6 +123,7 @@ def filter_collinear_toolpath_points(
     Behavior:
         Keeps first and last points and removes interior points whose cutter
         locations are closer than tolerance to neighboring line segments.
+        Contact-point deviation is also checked to preserve curvature detail.
     """
     if len(points) <= 2:
         return points[:]
@@ -131,17 +134,41 @@ def filter_collinear_toolpath_points(
         curr_point = points[index]
         next_point = points[index + 1]
 
-        deviation = point_line_deviation(
+        deviation_cl = point_line_deviation(
             curr_point.cl_point,
             prev_point.cl_point,
             next_point.cl_point,
         )
+        deviation_contact = point_line_deviation(
+            curr_point.contact_point,
+            prev_point.contact_point,
+            next_point.contact_point,
+        )
 
-        if deviation >= tolerance_mm:
+        if deviation_cl >= tolerance_mm or deviation_contact >= tolerance_mm:
             filtered.append(curr_point)
 
     filtered.append(points[-1])
     return filtered
+
+
+def _stable_normal(
+    du: np.ndarray,
+    dv: np.ndarray,
+    previous_normal: np.ndarray | None,
+) -> np.ndarray:
+    """Compute a stable unit normal, reusing prior direction when needed."""
+    cross_value = np.cross(du, dv)
+    cross_norm = float(np.linalg.norm(cross_value))
+    if cross_norm < EPSILON:
+        if previous_normal is not None:
+            return previous_normal
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+
+    normal = cross_value / cross_norm
+    if previous_normal is not None and float(np.dot(normal, previous_normal)) < 0.0:
+        normal = -normal
+    return normal
 
 
 def generate_zigzag_toolpath(
@@ -150,6 +177,8 @@ def generate_zigzag_toolpath(
     tool_radius_mm: float,
     u_samples: int = DEFAULT_TOOLPATH_SAMPLES_U,
     tolerance_mm: float = COLLINEAR_TOLERANCE_MM,
+    link_passes: bool = False,
+    link_samples: int = DEFAULT_LINK_SAMPLES,
 ) -> list[ToolpathPass]:
     """Generate zig-zag passes in u direction and offset points to CL positions.
 
@@ -167,11 +196,14 @@ def generate_zigzag_toolpath(
         Creates scanlines at increasing v values and alternates u traversal
         direction per pass. Each contact point is offset by R*n_hat to create
         cutter-location points and then simplified by tolerance filtering.
+        Optional surface-link moves are sampled along constant u between passes.
     """
     if tool_radius_mm <= 0.0:
         raise ValueError("tool_radius_mm must be greater than zero")
     if u_samples < 2:
         raise ValueError("u_samples must be at least 2")
+    if link_samples < 2:
+        raise ValueError("link_samples must be at least 2")
 
     (u_min, u_max), (v_min, v_max) = surface.parameter_ranges()
     v_step = estimate_v_step_from_mm(surface, stepover_mm)
@@ -185,6 +217,7 @@ def generate_zigzag_toolpath(
         v_values.append(float(v_max))
 
     passes: list[ToolpathPass] = []
+    previous_normal: np.ndarray | None = None
     for pass_index, v_value in enumerate(v_values):
         forward = pass_index % 2 == 0
         direction = "forward" if forward else "reverse"
@@ -196,10 +229,8 @@ def generate_zigzag_toolpath(
         raw_points: list[ToolpathPoint] = []
         for u_value in u_values:
             eval_result = surface.evaluate_derivatives(float(u_value), float(v_value))
-            normal = normalize_vector(
-                np.cross(eval_result.du, eval_result.dv),
-                fallback=np.array([0.0, 0.0, 1.0]),
-            )
+            normal = _stable_normal(eval_result.du, eval_result.dv, previous_normal)
+            previous_normal = normal
             cl_point = eval_result.point + tool_radius_mm * normal
             raw_points.append(
                 ToolpathPoint(
@@ -212,6 +243,33 @@ def generate_zigzag_toolpath(
             )
 
         filtered_points = filter_collinear_toolpath_points(raw_points, tolerance_mm)
-        passes.append(ToolpathPass(v_parameter=float(v_value), direction=direction, points=filtered_points))
+        link_points: list[ToolpathPoint] = []
+        if link_passes and pass_index < len(v_values) - 1:
+            next_v = float(v_values[pass_index + 1])
+            u_link = float(u_max if forward else u_min)
+            link_v_values = np.linspace(v_value, next_v, link_samples, endpoint=True)
+            for link_v in link_v_values:
+                eval_result = surface.evaluate_derivatives(u_link, float(link_v))
+                normal = _stable_normal(eval_result.du, eval_result.dv, previous_normal)
+                previous_normal = normal
+                cl_point = eval_result.point + tool_radius_mm * normal
+                link_points.append(
+                    ToolpathPoint(
+                        contact_point=eval_result.point,
+                        cl_point=cl_point,
+                        normal=normal,
+                        u_value=u_link,
+                        v_value=float(link_v),
+                    )
+                )
+
+        passes.append(
+            ToolpathPass(
+                v_parameter=float(v_value),
+                direction=direction,
+                points=filtered_points,
+                link_points=link_points,
+            )
+        )
 
     return passes

@@ -14,6 +14,9 @@ from config import (
 from machining.toolpath import ToolpathPass
 from utils.geometry import format_xyz
 
+LINK_MODE_RETRACT = "retract"
+LINK_MODE_SURFACE = "surface"
+
 
 @dataclass(frozen=True)
 class GCodeSettings:
@@ -24,6 +27,7 @@ class GCodeSettings:
         feed_rate_mm_per_min: Feed rate used for G1 cutting moves.
         plunge_rate_mm_per_min: Feed rate used when plunging from safe height.
         spindle_rpm: Spindle speed command value.
+        link_mode: "retract" to lift between passes, "surface" for link moves.
 
     Outputs:
         Immutable settings object consumed by G-code generation.
@@ -36,6 +40,7 @@ class GCodeSettings:
     feed_rate_mm_per_min: float = DEFAULT_FEED_RATE_MM_PER_MIN
     plunge_rate_mm_per_min: float = DEFAULT_PLUNGE_RATE_MM_PER_MIN
     spindle_rpm: int = DEFAULT_SPINDLE_RPM
+    link_mode: str = LINK_MODE_RETRACT
 
 
 def generate_gcode_program(
@@ -53,8 +58,8 @@ def generate_gcode_program(
 
     Behavior:
         Writes mandatory startup commands (G21, G90, M3, M8), inserts safe
-        rapid transitions between passes, emits G1 feed moves on surface points,
-        and closes with M30.
+        rapid transitions between passes unless surface linking is enabled,
+        emits G1 feed moves on surface points, and closes with M30.
     """
     lines: list[str] = []
 
@@ -72,16 +77,19 @@ def generate_gcode_program(
         lines.append("M30")
         return "\n".join(lines) + "\n"
 
+    linked_from_previous = False
     for pass_index, tool_pass in enumerate(passes):
         if not tool_pass.points:
+            linked_from_previous = False
             continue
 
         start = tool_pass.points[0].cl_point
         lines.append(f"(Pass {pass_index + 1}, v={tool_pass.v_parameter:.6f}, {tool_pass.direction})")
-        lines.append(f"G0 X{start[0]:.3f} Y{start[1]:.3f}")
-        lines.append(
-            f"G1 Z{start[2]:.3f} F{settings.plunge_rate_mm_per_min:.1f}"
-        )
+        if not linked_from_previous:
+            lines.append(f"G0 X{start[0]:.3f} Y{start[1]:.3f}")
+            lines.append(
+                f"G1 Z{start[2]:.3f} F{settings.plunge_rate_mm_per_min:.1f}"
+            )
 
         for point in tool_pass.points:
             lines.append(
@@ -89,7 +97,19 @@ def generate_gcode_program(
                 f"F{settings.feed_rate_mm_per_min:.1f}"
             )
 
-        lines.append(f"G0 Z{settings.safe_z_mm:.3f}")
+        use_surface_link = (
+            settings.link_mode == LINK_MODE_SURFACE and bool(tool_pass.link_points)
+        )
+        if use_surface_link:
+            for link_point in tool_pass.link_points:
+                lines.append(
+                    f"G1 {format_xyz(link_point.cl_point[0], link_point.cl_point[1], link_point.cl_point[2])} "
+                    f"F{settings.feed_rate_mm_per_min:.1f}"
+                )
+            linked_from_previous = True
+        else:
+            lines.append(f"G0 Z{settings.safe_z_mm:.3f}")
+            linked_from_previous = False
 
     lines.append("M9")
     lines.append("M5")

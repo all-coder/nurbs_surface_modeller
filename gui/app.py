@@ -12,6 +12,7 @@ import numpy as np
 from core.curve_validation import build_knots_for_mode
 from core.curves import BSplineCurve, BezierCurve, CurveObject, NURBSCurve
 from config import (
+    COLLINEAR_TOLERANCE_MM,
     DEFAULT_CONTROL_POINT_WIDGET_RADIUS,
     DEFAULT_DRAG_SENSITIVITY,
     DEFAULT_DRAG_UPDATE_INTERVAL_SEC,
@@ -25,7 +26,13 @@ from config import (
     DEFAULT_SURFACE_SAMPLES_V,
     DEFAULT_TOOL_RADIUS_MM,
 )
-from gcode.exporter import GCodeSettings, generate_gcode_program, write_gcode_file
+from gcode.exporter import (
+    GCodeSettings,
+    LINK_MODE_RETRACT,
+    LINK_MODE_SURFACE,
+    generate_gcode_program,
+    write_gcode_file,
+)
 from machining.toolpath import ToolpathPass, generate_zigzag_toolpath
 from surface.factory import create_default_surface
 from surface.providers.extrusion import extrude_surface_from_curve
@@ -2002,11 +2009,21 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
         self.radius_spin.setValue(DEFAULT_TOOL_RADIUS_MM)
         self.radius_spin.setDecimals(3)
 
+        self.tolerance_spin = QtWidgets.QDoubleSpinBox()
+        self.tolerance_spin.setRange(0.001, 5.0)
+        self.tolerance_spin.setValue(COLLINEAR_TOLERANCE_MM)
+        self.tolerance_spin.setDecimals(3)
+
+        self.link_passes_check = QtWidgets.QCheckBox("Link passes on surface (G1)")
+        self.link_passes_check.setChecked(False)
+
         self.generate_toolpath_button = QtWidgets.QPushButton("Generate Zig-Zag Toolpath")
         self.generate_toolpath_button.clicked.connect(self._on_generate_toolpath)
 
         layout.addRow("Stepover (mm)", self.stepover_spin)
         layout.addRow("Tool radius (mm)", self.radius_spin)
+        layout.addRow("Chord tolerance (mm)", self.tolerance_spin)
+        layout.addRow("Pass linking", self.link_passes_check)
         layout.addRow(self.generate_toolpath_button)
 
         parent_layout.addWidget(group)
@@ -2907,6 +2924,8 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             surface=self.surface,
             stepover_mm=float(self.stepover_spin.value()),
             tool_radius_mm=float(self.radius_spin.value()),
+            tolerance_mm=float(self.tolerance_spin.value()),
+            link_passes=self.link_passes_check.isChecked(),
         )
         self._refresh_scene(reset_camera=False)
         self._sync_ui_enabled_state()
@@ -2940,6 +2959,16 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             line_mesh = pv.lines_from_points(points, close=False)
             actor = self.plotter.add_mesh(line_mesh, color="#2a9d8f", line_width=3)
             self._toolpath_actors.append(actor)
+
+            if tool_pass.link_points:
+                link_points = np.array(
+                    [item.cl_point for item in tool_pass.link_points],
+                    dtype=float,
+                )
+                if len(link_points) >= 2:
+                    link_mesh = pv.lines_from_points(link_points, close=False)
+                    actor = self.plotter.add_mesh(link_mesh, color="#e76f51", line_width=2)
+                    self._toolpath_actors.append(actor)
 
     def _clear_toolpath_actors(self) -> None:
         """Remove currently displayed toolpath actors from the viewport.
@@ -2994,6 +3023,9 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
             feed_rate_mm_per_min=float(self.feed_spin.value()),
             plunge_rate_mm_per_min=float(self.plunge_spin.value()),
             spindle_rpm=int(self.spindle_spin.value()),
+            link_mode=(
+                LINK_MODE_SURFACE if self.link_passes_check.isChecked() else LINK_MODE_RETRACT
+            ),
         )
         gcode_text = generate_gcode_program(self.generated_passes, settings)
         written_path = write_gcode_file(Path(output_file), gcode_text)

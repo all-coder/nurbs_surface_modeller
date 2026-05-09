@@ -84,6 +84,53 @@ class TestSurfaceAndToolpath(unittest.TestCase):
         for token in ("G21", "G90", "M3", "M8", "G0", "G1", "M30"):
             self.assertIn(token, gcode_text)
 
+    def test_toolpath_is_3d_and_offsets_by_radius(self) -> None:
+        """Ensure CL points vary in Z and keep the tool radius offset."""
+        tool_radius = 2.0
+        surface = create_default_surface(rows=6, cols=6)
+        passes = generate_zigzag_toolpath(surface, stepover_mm=1.0, tool_radius_mm=tool_radius)
+        self.assertGreater(len(passes), 1)
+
+        points = [item for tool_pass in passes for item in tool_pass.points]
+        self.assertGreater(len(points), 10)
+
+        z_values = [float(item.cl_point[2]) for item in points]
+        self.assertGreater(max(z_values) - min(z_values), 0.1)
+
+        for item in points[: min(30, len(points))]:
+            self.assertAlmostEqual(float(np.linalg.norm(item.normal)), 1.0, places=6)
+            self.assertAlmostEqual(
+                float(np.linalg.norm(item.cl_point - item.contact_point)),
+                tool_radius,
+                places=5,
+            )
+
+        repeat = generate_zigzag_toolpath(surface, stepover_mm=1.0, tool_radius_mm=tool_radius)
+        points_repeat = [item for tool_pass in repeat for item in tool_pass.points]
+        self.assertEqual(len(points), len(points_repeat))
+        cl_points = np.array([item.cl_point for item in points], dtype=float)
+        cl_points_repeat = np.array([item.cl_point for item in points_repeat], dtype=float)
+        self.assertTrue(np.allclose(cl_points, cl_points_repeat))
+
+    def test_surface_link_points_follow_constant_u(self) -> None:
+        """Verify surface link samples stay on a constant-u boundary."""
+        surface = create_default_surface(rows=5, cols=5)
+        passes = generate_zigzag_toolpath(
+            surface,
+            stepover_mm=2.0,
+            tool_radius_mm=1.5,
+            link_passes=True,
+        )
+        self.assertGreater(len(passes), 1)
+
+        link_counts = [len(tool_pass.link_points) for tool_pass in passes[:-1]]
+        self.assertTrue(all(count >= 2 for count in link_counts))
+
+        first_link = passes[0].link_points
+        self.assertGreaterEqual(len(first_link), 2)
+        u_values = {round(float(item.u_value), 7) for item in first_link}
+        self.assertEqual(len(u_values), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
