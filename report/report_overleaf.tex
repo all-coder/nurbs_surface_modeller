@@ -642,16 +642,10 @@ by vector magnitude) ensures unit normals for accurate offset computation.
 
 \begin{figure}[H]
   \centering
-  \fbox{\parbox{0.85\textwidth}{\centering\vspace{3.2cm}
-        \textit{Placeholder: Toolpath visualization in PyVista viewport showing
-                 the NURBS surface with overlaid zigzag toolpath passes rendered
-                 as colored polylines (scanlines), CL points as markers, and
-                 surface normals as vectors at selected points.}
-        \vspace{3.2cm}}}
-  \caption{Rendered toolpath showing the zigzag scanning pattern overlaid on
-           the NURBS surface. Different pass colors distinguish forward/reverse
-           directions. Cutter location (CL) points are displayed above the
-           surface, offset along surface normals by tool radius.}
+  \includegraphics[width=0.85\textwidth]{assets/6.png}
+  \caption{Rendered 3D toolpath showing the zigzag scanning pattern generated over the
+full body extrusion derived from the NURBS surface. Different pass colors
+distinguish forward and reverse scan directions across the extruded 3D geometry.}
   \label{fig:toolpath_visualization}
 \end{figure}
 
@@ -729,12 +723,7 @@ The exporter successfully generated CNC programs with:
 
 \begin{figure}[H]
   \centering
-  \fbox{\parbox{0.85\textwidth}{\centering\vspace{3.0cm}
-        \textit{Placeholder: G-Code Export panel in GUI showing feed rate,
-                 plunge rate, safe Z settings, spindle RPM controls, and the
-                 Export G-code button. Also shows file save dialog or exported
-                 .nc file preview in text editor.}
-        \vspace{3.0cm}}}
+  \includegraphics[width=0.85\textwidth]{assets/7.png}
   \caption{G-Code export interface showing CNC machine configuration parameters
            (feed rate, plunge rate, safe height, spindle speed) and the export
            button for generating ISO 6983-compliant machine code files.}
@@ -871,32 +860,6 @@ R.~K.~Luo, S.~Huo, and Y.~H.~Park,
 ``Parametric surface machining using recursive moving least squares
 approximation,''
 \emph{Int.\ J.\ Prod.\ Res.}, vol.~42, no.~13, pp.~2677--2697, Jul.~2004.
-
-% \bibitem{ref6}
-% T.~M.~Sederberg and S.~R.~Parry,
-% ``Free-form deformation of solid geometric models,''
-% in \emph{Proc.\ 13th Annu.\ Conf.\ Comput.\ Graph.\ Interact.\ Tech.}
-% (SIGGRAPH '86), New York, NY, USA, 1986, pp.~151--160.
-
-% \bibitem{ref7}
-% K.~He and H.~Ding,
-% ``Computation of the minimum distance between two B\'{e}zier surfaces,''
-% \emph{Adv.\ Eng.\ Softw.}, vol.~36, no.~9, pp.~590--596, Sep.~2005.
-
-% \bibitem{ref8}
-% J.~E.~Korein and N.~I.~Badler,
-% ``Techniques for goal-directed motion,'' in
-% \emph{IEEE Comput.\ Graph.\ Appl.}, vol.~2, no.~9, pp.~71--81, Nov.~1982.
-
-% \bibitem{ref9}
-% S.~R.~Marton and R.~Kolesnichenko,
-% ``Geometric algorithms for CAM systems,''
-% \emph{Comput.\ Aided Geom.\ Design}, vol.~15, no.~3, pp.~231--248, Mar.~1998.
-
-% \bibitem{ref10}
-% ``ISO 6983-1: Automation systems and integration—Numerical control of
-% machines—Program format and definition of address words,'' International
-% Organization for Standardization, Geneva, Switzerland, 2009.
 
 \end{thebibliography}
 
