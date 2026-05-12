@@ -3009,7 +3009,6 @@ class NURBSSurfaceMainWindow(QtWidgets.QMainWindow):
                     tool_radius_mm=float(self.radius_spin.value()),
                     tolerance_mm=float(self.tolerance_spin.value()),
                     link_passes=self.link_passes_check.isChecked(),
-                    scan_axis=surface_scan_axis,
                 )
         except ValueError as error:
             self.status_label.setText(f"Toolpath generation failed: {error}")
