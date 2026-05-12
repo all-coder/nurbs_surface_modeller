@@ -47,8 +47,6 @@ NURBS_SurfaceModeller/
 ├── main.py
 ├── config.py
 ├── requirements.txt
-├── workflow.md
-├── smoke_drag_update.nc
 │
 ├── core/
 │   ├── __init__.py
@@ -93,7 +91,7 @@ NURBS_SurfaceModeller/
 │
 ├── report/
 │   ├── report.tex
-│   └── report_overleaf.tex
+│   └── workflow.md
 │
 └── assets/
 ```
